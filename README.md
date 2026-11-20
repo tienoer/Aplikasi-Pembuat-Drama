@@ -436,6 +436,8 @@
       selectedEpisodeNumber: 1,
       isEditingScript: false,
       currentAudio: null,
+      audioPlayer: null,
+      selectedVoice: 'Kore',
       showDashboardGuide: true
     };
 
@@ -723,7 +725,11 @@
     }
 
     function base64ToArrayBuffer(base64) {
-      const binaryString = atob(base64);
+      const sanitized = String(base64 || '')
+        .replace(/-/g, '+')
+        .replace(/_/g, '/')
+        .replace(/\s+/g, '');
+      const binaryString = atob(sanitized);
       const len = binaryString.length;
       const bytes = new Uint8Array(len);
       for (let i = 0; i < len; i++) {
@@ -771,9 +777,10 @@
 
     async function callGeminiTTS(text, voiceName = 'Kore') {
       const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
+      const cleanText = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 1200);
       const payload = {
         contents: [{
-          parts: [{ text: `Bacakan naskah drama Indonesia berikut dengan penghayatan sinematik yang emosional:\n\n${text}` }]
+          parts: [{ text: `Bacakan naskah drama Indonesia berikut dengan intonasi emosional dan dramatis: ${cleanText}` }]
         }],
         generationConfig: {
           responseModalities: ["AUDIO"],
@@ -792,18 +799,20 @@
         body: JSON.stringify(payload)
       });
 
-      const part = result?.candidates?.[0]?.content?.parts?.[0];
+      const parts = result?.candidates?.[0]?.content?.parts || [];
+      const part = parts.find(p => p.inlineData && p.inlineData.data);
       const audioData = part?.inlineData?.data;
       const mimeType = part?.inlineData?.mimeType || 'audio/L16;rate=24000';
 
       if (!audioData) {
-        throw new Error('Data audio tidak tersedia.');
+        throw new Error('Data audio tidak ditemukan dalam respons AI.');
       }
 
       const rateMatch = mimeType.match(/rate=(\d+)/);
       const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
       const pcmBuffer = base64ToArrayBuffer(audioData);
-      const pcm16 = new Int16Array(pcmBuffer);
+      const evenByteLength = pcmBuffer.byteLength - (pcmBuffer.byteLength % 2);
+      const pcm16 = new Int16Array(pcmBuffer, 0, evenByteLength / 2);
       const wavBlob = pcmToWav(pcm16, sampleRate);
       return URL.createObjectURL(wavBlob);
     }
@@ -2266,6 +2275,7 @@ Jumlah episode yang wajib dibuat: tepat ${s.episodeCount} episode (nomor 1 sampa
     }
 
     function renderScriptReader(script, epNum) {
+      const activeAudio = appState.audioPlayer && appState.audioPlayer.epNum === epNum ? appState.audioPlayer : null;
       return `
         <div class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 overflow-hidden shadow-sm">
           <!-- Screenplay Cover Header -->
@@ -2274,9 +2284,16 @@ Jumlah episode yang wajib dibuat: tepat ${s.episodeCount} episode (nomor 1 sampa
               <span class="px-3 py-1 rounded-full bg-amber-500/20 border border-amber-400/30 text-amber-300 text-xs font-bold tracking-wider">
                 EPISODE ${script.episodeNumber}
               </span>
-              <div class="flex items-center gap-2">
-                <button onclick="playEpisodeAudioPreview(${epNum})" class="px-3.5 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 text-xs font-semibold flex items-center gap-1.5 transition-colors">
-                  <i data-lucide="volume-2" class="w-3.5 h-3.5 text-amber-400"></i>
+              <div class="flex flex-wrap items-center gap-2">
+                <select onchange="appState.selectedVoice = this.value" title="Pilih Karakter Suara AI"
+                  class="px-2.5 py-1.5 rounded-xl bg-white/10 border border-white/15 text-xs text-white focus:outline-none">
+                  <option value="Kore" class="text-slate-900" ${appState.selectedVoice === 'Kore' ? 'selected' : ''}>Suara: Kore (Dramatis)</option>
+                  <option value="Aoede" class="text-slate-900" ${appState.selectedVoice === 'Aoede' ? 'selected' : ''}>Suara: Aoede (Lembut)</option>
+                  <option value="Puck" class="text-slate-900" ${appState.selectedVoice === 'Puck' ? 'selected' : ''}>Suara: Puck (Ekspresif)</option>
+                  <option value="Charon" class="text-slate-900" ${appState.selectedVoice === 'Charon' ? 'selected' : ''}>Suara: Charon (Berwibawa)</option>
+                </select>
+                <button onclick="playEpisodeAudioPreview(${epNum})" class="px-3.5 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold flex items-center gap-1.5 transition-colors">
+                  <i data-lucide="volume-2" class="w-3.5 h-3.5"></i>
                   <span>Dengarkan Pembacaan AI</span>
                 </button>
                 <button onclick="copyEpisodeScriptText(${epNum})" class="px-3.5 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 text-xs font-semibold flex items-center gap-1.5 transition-colors">
@@ -2285,6 +2302,31 @@ Jumlah episode yang wajib dibuat: tepat ${s.episodeCount} episode (nomor 1 sampa
                 </button>
               </div>
             </div>
+
+            ${activeAudio ? `
+              <div class="mb-4 p-3.5 rounded-2xl bg-slate-950/80 border border-amber-400/40 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div class="flex items-center gap-2.5 text-xs">
+                  <span class="w-2.5 h-2.5 rounded-full bg-amber-400 animate-ping"></span>
+                  <div>
+                    <div class="font-bold text-amber-300">Pemutar Suara Naskah Episode ${epNum}</div>
+                    <div class="text-slate-400 text-[11px]">${activeAudio.isFallback ? 'Mode Sulih Suara Browser (Bahasa Indonesia)' : 'Audio HD Gemini TTS (' + escapeHtml(activeAudio.voiceName) + ')'}</div>
+                  </div>
+                </div>
+                <div class="flex items-center gap-2 flex-1 sm:justify-end">
+                  ${activeAudio.audioUrl ? `
+                    <audio id="episode-tts-audio" controls autoplay src="${activeAudio.audioUrl}" class="h-9 max-w-full sm:w-72 rounded-lg"></audio>
+                    <a href="${activeAudio.audioUrl}" download="Audio_Episode_${epNum}.wav" title="Unduh Audio WAV" class="p-2 rounded-xl bg-white/10 hover:bg-amber-500 hover:text-slate-950 transition-colors">
+                      <i data-lucide="download" class="w-4 h-4"></i>
+                    </a>
+                  ` : `
+                    <button onclick="playBrowserSpeechFallback(${epNum})" class="px-3 py-1.5 rounded-xl bg-amber-500 text-slate-950 font-bold text-xs">Putar Ulang</button>
+                  `}
+                  <button onclick="stopEpisodeAudio()" title="Tutup Pemutar" class="p-2 rounded-xl bg-white/10 hover:bg-rose-500/80 transition-colors">
+                    <i data-lucide="x" class="w-4 h-4"></i>
+                  </button>
+                </div>
+              </div>
+            ` : ''}
 
             <h2 class="font-serif font-bold text-2xl sm:text-3xl mb-3">${escapeHtml(script.title)}</h2>
             <p class="text-sm text-slate-300 leading-relaxed mb-5">${escapeHtml(script.summary)}</p>
@@ -2440,7 +2482,7 @@ Jumlah episode yang wajib dibuat: tepat ${s.episodeCount} episode (nomor 1 sampa
 
     function saveEditedScript(epNum) {
       const proj = getActiveProject();
-      const script = proj.scripts[epNum];
+      const script = proj.scripts?.[epNum];
       if (!script) return;
 
       script.title = document.getElementById('edit-ep-title').value;
@@ -2449,19 +2491,25 @@ Jumlah episode yang wajib dibuat: tepat ${s.episodeCount} episode (nomor 1 sampa
       script.closingCliffhanger = document.getElementById('edit-ep-cliff').value;
 
       (script.scenes || []).forEach((sc, sIdx) => {
-        sc.heading = document.getElementById(`edit-sc-head-${sIdx}`).value;
-        sc.narration = document.getElementById(`edit-sc-narr-${sIdx}`).value;
+        const headEl = document.getElementById(`edit-sc-head-${sIdx}`);
+        const narrEl = document.getElementById(`edit-sc-narr-${sIdx}`);
+        if (headEl) sc.heading = headEl.value;
+        if (narrEl) sc.narration = narrEl.value;
+
         (sc.dialogue || []).forEach((d, dIdx) => {
-          d.character = document.getElementById(`edit-dlg-char-${sIdx}-${dIdx}`).value;
-          d.emotion = document.getElementById(`edit-dlg-emo-${sIdx}-${dIdx}`).value;
-          d.line = document.getElementById(`edit-dlg-line-${sIdx}-${dIdx}`).value;
+          const charEl = document.getElementById(`edit-dlg-char-${sIdx}-${dIdx}`);
+          const emoEl = document.getElementById(`edit-dlg-emo-${sIdx}-${dIdx}`);
+          const lineEl = document.getElementById(`edit-dlg-line-${sIdx}-${dIdx}`);
+          if (charEl) d.character = charEl.value;
+          if (emoEl) d.emotion = emoEl.value;
+          if (lineEl) d.line = lineEl.value;
         });
       });
 
       appState.isEditingScript = false;
       saveState();
       renderApp();
-      showToast('Naskah berhasil diperbarui!', 'success');
+      showToast('Perubahan naskah berhasil disimpan!', 'success');
     }
 
     const SCRIPT_JSON_SCHEMA = {
@@ -2510,28 +2558,25 @@ Jumlah episode yang wajib dibuat: tepat ${s.episodeCount} episode (nomor 1 sampa
       const s = proj.settings;
       const genre = proj.customGenre || proj.genre;
       const outline = proj.storyArc?.episodes?.find(e => Number(e.episodeNumber) === epNum);
-      const prevScript = proj.scripts?.[epNum - 1];
-      const charDetails = (proj.characters || []).map(c =>
-        `${c.name} (${c.role}, sifat: ${c.personality}, ciri fisik: ${c.physicalTraits}, pakaian: ${c.clothingStyle})`
-      ).join('\n');
+      const prevScript = epNum > 1 ? proj.scripts?.[epNum - 1] : null;
+      const charList = (proj.characters || []).map(c => `${c.name} (${c.role}, sifat: ${c.personality})`).join('; ');
 
-      setLoading(true, `Menulis Naskah Lengkap Episode ${epNum}...`, 'AI sedang menyusun adegan pembuka, dialog penuh emosi, arahan kamera, musik latar, dan cliffhanger.');
+      setLoading(true, `Menulis Naskah Episode ${epNum}...`, 'AI sedang menyusun adegan pembuka, dialog beremosi, arahan kamera, musik, dan cliffhanger.');
       try {
         const scriptData = await callGeminiText({
-          systemPrompt: 'Kamu adalah Penulis Skenario & Sutradara Drama Indonesia profesional. Tulis naskah episode drama yang sangat emosional, hidup, sinematik, dengan dialog natural, arahan kamera spesifik, serta kontinuitas ketat dengan episode sebelumnya.',
-          userPrompt: `Tulis naskah lengkap untuk EPISODE ${epNum} dari total ${s.episodeCount} episode serial drama "${s.title}" (Genre: ${genre}, Durasi: ${s.episodeDuration}).
-Sinopsis Serial: ${s.synopsis}
-Latar & Zaman: ${s.settingPlace} (${s.era}), Suasana: ${s.mood}.
-${outline ? `Outline Episode ${epNum}: Judul "${outline.title}", Ringkasan: ${outline.summary}, Benang Merah: ${outline.connectionToMainArc}, Target Cliffhanger: ${outline.cliffhanger}` : ''}
-${prevScript ? `Ringkasan & Cliffhanger Episode Sebelumnya (Ep ${epNum - 1}): ${prevScript.closingCliffhanger}` : 'Ini adalah episode perdana.'}
-Daftar Karakter Resmi (gunakan nama dan ciri fisik/pakaian yang konsisten):
-${charDetails || 'Gunakan karakter yang sesuai cerita.'}
-Buat minimal 4 adegan dramatis yang kaya akan dialog, emosi, arahan kamera, dan deskripsi visual.`,
+          systemPrompt: 'Kamu adalah Penulis Skenario & Sutradara serial drama profesional Indonesia. Tulis naskah episode yang hidup, emosional, sinematik, dengan pembagian adegan jelas, arahan kamera, dan dialog natural.',
+          userPrompt: `Tulis naskah lengkap untuk Episode ${epNum} dari total ${s.episodeCount} episode serial drama "${s.title}" (Genre: ${genre}).
+Latar tempat: ${s.settingPlace} (${s.era}). Suasana: ${s.mood}. Durasi target: ${s.episodeDuration}.
+Karakter tersedia: ${charList || 'Gunakan tokoh utama yang sesuai cerita'}.
+${outline ? `Panduan Alur Episode ${epNum}: Judul "${outline.title}", Ringkasan: ${outline.summary}, Cliffhanger: ${outline.cliffhanger}.` : `Sinopsis Serial: ${s.synopsis}.`}
+${prevScript ? `Kelanjutan dari Episode ${epNum - 1} yang ditutup dengan: "${prevScript.closingCliffhanger}".` : 'Ini adalah episode perdana yang harus langsung memikat penonton.'}
+Buat minimal 3 hingga 4 adegan lengkap beserta dialog, ekspresi emosi, gerakan kamera, dan musik suasana.`,
           responseSchema: SCRIPT_JSON_SCHEMA
         });
 
         scriptData.episodeNumber = epNum;
         proj.scripts[epNum] = scriptData;
+        appState.isEditingScript = false;
         saveState();
         renderApp();
         showToast(`Naskah Episode ${epNum} berhasil dibuat!`, 'success');
@@ -2616,31 +2661,95 @@ ${JSON.stringify(currentScript)}`,
       }
     }
 
+    function stopEpisodeAudio() {
+      if (appState.currentAudio) {
+        try {
+          appState.currentAudio.pause();
+        } catch (e) {}
+        appState.currentAudio = null;
+      }
+      if ('speechSynthesis' in window) {
+        try {
+          window.speechSynthesis.cancel();
+        } catch (e) {}
+      }
+      if (appState.audioPlayer?.audioUrl) {
+        try {
+          URL.revokeObjectURL(appState.audioPlayer.audioUrl);
+        } catch (e) {}
+      }
+      appState.audioPlayer = null;
+      renderApp();
+    }
+
+    function playBrowserSpeechFallback(epNum) {
+      const proj = getActiveProject();
+      const script = proj.scripts?.[epNum];
+      if (!script || !('speechSynthesis' in window)) return;
+
+      window.speechSynthesis.cancel();
+      const firstScene = script.scenes?.[0];
+      const sampleDialogue = firstScene?.dialogue?.slice(0, 3).map(d => `${d.character}. ${d.line}`).join('. ') || '';
+      const textToRead = `Episode ${epNum}: ${script.title}. ${script.openingHook}. ${sampleDialogue}`;
+
+      const utterance = new SpeechSynthesisUtterance(textToRead);
+      utterance.lang = 'id-ID';
+      utterance.rate = 0.96;
+      const voices = window.speechSynthesis.getVoices();
+      const idVoice = voices.find(v => v.lang && v.lang.toLowerCase().includes('id'));
+      if (idVoice) utterance.voice = idVoice;
+      window.speechSynthesis.speak(utterance);
+    }
+
     async function playEpisodeAudioPreview(epNum) {
       const proj = getActiveProject();
       const script = proj.scripts?.[epNum];
       if (!script) return;
 
-      if (appState.currentAudio) {
-        appState.currentAudio.pause();
-        appState.currentAudio = null;
-      }
+      stopEpisodeAudio();
 
       const firstScene = script.scenes?.[0];
-      const sampleDialogue = firstScene?.dialogue?.slice(0, 3).map(d => `${d.character}: ${d.line}`).join('\n') || '';
-      const textToRead = `Episode ${epNum}: ${script.title}. ${script.openingHook}\n\n${sampleDialogue}`;
+      const sampleDialogue = firstScene?.dialogue?.slice(0, 3).map(d => `${d.character}: ${d.line}`).join('. ') || '';
+      const textToRead = `Episode ${epNum}: ${script.title}. ${script.openingHook}. ${sampleDialogue}`;
+      const chosenVoice = appState.selectedVoice || 'Kore';
 
       setLoading(true, 'Menyiapkan Pembacaan Dramatis (AI Voice)...', 'Sedang menghasilkan audio narasi dan cuplikan dialog pembuka.');
       try {
-        const audioUrl = await callGeminiTTS(textToRead, 'Kore');
-        const audio = new Audio(audioUrl);
-        appState.currentAudio = audio;
-        audio.play();
-        showToast('Memutar pembacaan naskah episode...', 'success');
-      } catch (err) {
-        showToast('Audio tidak dapat diputar saat ini: ' + err.message, 'error');
-      } finally {
+        const audioUrl = await callGeminiTTS(textToRead, chosenVoice);
+        appState.audioPlayer = {
+          epNum,
+          title: script.title,
+          audioUrl,
+          voiceName: chosenVoice,
+          isFallback: false
+        };
         setLoading(false);
+        renderApp();
+
+        const audioEl = document.getElementById('episode-tts-audio');
+        if (audioEl) {
+          appState.currentAudio = audioEl;
+          audioEl.play().catch(() => {
+            showToast('Audio siap! Tekan tombol Play pada pemutar di atas jika browser menahan putar otomatis.', 'info');
+          });
+        }
+        showToast('Audio pembacaan naskah siap diputar!', 'success');
+      } catch (err) {
+        setLoading(false);
+        if ('speechSynthesis' in window) {
+          appState.audioPlayer = {
+            epNum,
+            title: script.title,
+            audioUrl: '',
+            voiceName: 'Browser ID',
+            isFallback: true
+          };
+          renderApp();
+          playBrowserSpeechFallback(epNum);
+          showToast('Memutar pembacaan naskah menggunakan suara Bahasa Indonesia perangkat Anda.', 'info');
+        } else {
+          showToast('Audio tidak dapat diputar di perangkat ini: ' + err.message, 'error');
+        }
       }
     }
 
@@ -2783,10 +2892,14 @@ ${JSON.stringify(currentScript)}`,
 
                     ${item.imageUrl ? `
                       <div class="flex items-center gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
-                        <a href="${item.imageUrl}" download="${escapeHtml(item.title.replace(/\s+/g, '_'))}.png"
-                          class="flex-1 py-2 px-3 rounded-xl bg-slate-100 dark:bg-studio-800 hover:bg-amber-500 hover:text-slate-950 text-xs font-semibold text-center transition-colors">
-                          Unduh Gambar
-                        </a>
+                        <button onclick="downloadGalleryImage('${item.id}')"
+                          class="flex-1 py-2 px-3 rounded-xl bg-slate-100 dark:bg-studio-800 hover:bg-amber-500 hover:text-slate-950 text-xs font-semibold text-center transition-colors flex items-center justify-center gap-1.5">
+                          <i data-lucide="download" class="w-3.5 h-3.5"></i>
+                          <span>Unduh Gambar</span>
+                        </button>
+                        <button onclick="shareGalleryImage('${item.id}')" class="p-2 rounded-xl bg-slate-100 dark:bg-studio-800 hover:text-amber-500 transition-colors" title="Simpan ke Galeri / Bagikan di HP">
+                          <i data-lucide="share-2" class="w-4 h-4"></i>
+                        </button>
                         <button onclick="previewImageFullscreen('${item.id}')" class="p-2 rounded-xl bg-slate-100 dark:bg-studio-800 hover:text-amber-500 transition-colors" title="Perbesar">
                           <i data-lucide="maximize-2" class="w-4 h-4"></i>
                         </button>
@@ -2799,6 +2912,107 @@ ${JSON.stringify(currentScript)}`,
           </section>
         </div>
       `;
+    }
+
+    function dataUrlToBlob(dataUrl) {
+      if (!dataUrl || typeof dataUrl !== 'string') {
+        throw new Error('Sumber gambar tidak valid.');
+      }
+      if (!dataUrl.startsWith('data:')) {
+        throw new Error('Format gambar bukan data URL.');
+      }
+      const commaIndex = dataUrl.indexOf(',');
+      if (commaIndex === -1) {
+        throw new Error('Data gambar tidak lengkap.');
+      }
+      const header = dataUrl.slice(0, commaIndex);
+      const base64Body = dataUrl.slice(commaIndex + 1).replace(/\s+/g, '');
+      const mimeMatch = header.match(/data:([^;]+)/i);
+      const mimeType = mimeMatch ? mimeMatch[1] : 'image/png';
+
+      const binaryStr = atob(base64Body);
+      const len = binaryStr.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        bytes[i] = binaryStr.charCodeAt(i);
+      }
+      return new Blob([bytes], { type: mimeType });
+    }
+
+    function sanitizeImageFilename(rawTitle, mimeType = 'image/png') {
+      const ext = mimeType.includes('jpeg') || mimeType.includes('jpg') ? 'jpg' : 'png';
+      const clean = String(rawTitle || 'DramaStudioAI_Visual')
+        .replace(/[^a-zA-Z0-9_-]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 60) || 'DramaStudioAI_Visual';
+      return `${clean}.${ext}`;
+    }
+
+    function downloadDataUrlImage(dataUrl, rawFilename) {
+      try {
+        const blob = dataUrlToBlob(dataUrl);
+        const filename = sanitizeImageFilename(rawFilename, blob.type);
+        const blobUrl = URL.createObjectURL(blob);
+
+        const link = document.createElement('a');
+        link.style.display = 'none';
+        link.href = blobUrl;
+        link.download = filename;
+        link.rel = 'noopener';
+        document.body.appendChild(link);
+        link.click();
+
+        setTimeout(() => {
+          if (link.parentNode) {
+            document.body.removeChild(link);
+          }
+          URL.revokeObjectURL(blobUrl);
+        }, 60000);
+
+        showToast('Mengunduh gambar... Jika di HP tidak otomatis tersimpan, tekan tombol Bagikan atau tekan lama pada gambar.', 'success');
+      } catch (err) {
+        showToast('Gagal menyiapkan unduhan gambar: ' + err.message, 'error');
+      }
+    }
+
+    async function shareDataUrlImage(dataUrl, rawFilename, titleText = 'Visual Drama Studio AI') {
+      try {
+        const blob = dataUrlToBlob(dataUrl);
+        const filename = sanitizeImageFilename(rawFilename, blob.type);
+        const file = new File([blob], filename, { type: blob.type });
+
+        if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+          await navigator.share({
+            files: [file],
+            title: titleText,
+            text: `Visual dari DRAMA STUDIO AI: ${titleText}`
+          });
+          showToast('Berhasil membuka menu simpan/bagikan HP!', 'success');
+        } else {
+          downloadDataUrlImage(dataUrl, rawFilename);
+        }
+      } catch (err) {
+        if (err && err.name !== 'AbortError') {
+          downloadDataUrlImage(dataUrl, rawFilename);
+        }
+      }
+    }
+
+    function downloadGalleryImage(imgId) {
+      const proj = getActiveProject();
+      const item = (proj.gallery || []).find(g => g.id === imgId);
+      if (!item || !item.imageUrl) {
+        showToast('Gambar belum tersedia untuk diunduh.', 'warning');
+        return;
+      }
+      downloadDataUrlImage(item.imageUrl, item.title);
+    }
+
+    function shareGalleryImage(imgId) {
+      const proj = getActiveProject();
+      const item = (proj.gallery || []).find(g => g.id === imgId);
+      if (!item || !item.imageUrl) return;
+      shareDataUrlImage(item.imageUrl, item.title, item.title);
     }
 
     function handleVisualCategoryChange() {
@@ -2953,6 +3167,18 @@ Style: ${VISUAL_STYLES[0].prompt}.`;
         });
 
         saveState();
+        const createdImgId = 'img_' + Date.now();
+        proj.gallery.unshift({
+          id: createdImgId,
+          category: 'Ilustrasi setiap adegan',
+          title: `Ep ${epNum} - Adegan ${sceneIdx + 1}: ${scene.heading}`,
+          styleName: 'Realistis seperti film layar lebar',
+          prompt,
+          imageUrl,
+          createdAt: new Date().toISOString()
+        });
+
+        saveState();
         showToast('Ilustrasi adegan berhasil dibuat! Menampilkan hasil...', 'success');
 
         openModal(`
@@ -2962,10 +3188,20 @@ Style: ${VISUAL_STYLES[0].prompt}.`;
               <i data-lucide="x" class="w-5 h-5"></i>
             </button>
           </div>
-          <img src="${imageUrl}" alt="Ilustrasi Adegan" class="w-full rounded-2xl border border-slate-700 mb-4">
-          <div class="flex justify-between items-center gap-2">
+          <img src="${imageUrl}" alt="Ilustrasi Adegan" class="w-full rounded-2xl border border-slate-700 mb-2">
+          <p class="text-[11px] text-slate-400 mb-4">Tips HP: Anda dapat menekan tombol Unduh, Bagikan ke Galeri, atau tekan lama langsung pada gambar di atas.</p>
+          <div class="flex flex-wrap justify-between items-center gap-2">
             <button onclick="closeModal(); navigateTo('visuals');" class="px-4 py-2 rounded-xl bg-slate-200 dark:bg-studio-800 text-xs font-semibold">Lihat di Galeri Visual</button>
-            <a href="${imageUrl}" download="Ep${epNum}_Adegan${sceneIdx + 1}.png" class="px-4 py-2 rounded-xl bg-amber-500 text-slate-950 text-xs font-bold">Unduh Gambar</a>
+            <div class="flex items-center gap-2">
+              <button onclick="shareGalleryImage('${createdImgId}')" class="px-3.5 py-2 rounded-xl bg-slate-200 dark:bg-studio-800 text-xs font-bold flex items-center gap-1.5">
+                <i data-lucide="share-2" class="w-3.5 h-3.5"></i>
+                <span>Simpan / Bagikan</span>
+              </button>
+              <button onclick="downloadGalleryImage('${createdImgId}')" class="px-4 py-2 rounded-xl bg-amber-500 text-slate-950 text-xs font-bold flex items-center gap-1.5">
+                <i data-lucide="download" class="w-3.5 h-3.5"></i>
+                <span>Unduh Gambar</span>
+              </button>
+            </div>
           </div>
         `);
       } catch (err) {
@@ -2990,38 +3226,16 @@ Style: ${VISUAL_STYLES[0].prompt}.`;
             <i data-lucide="x" class="w-5 h-5"></i>
           </button>
         </div>
-        <img src="${item.imageUrl}" alt="${escapeHtml(item.title)}" class="w-full max-h-[70vh] object-contain rounded-2xl bg-black mb-4">
-        <div class="flex justify-end">
-          <a href="${item.imageUrl}" download="${escapeHtml(item.title.replace(/\s+/g, '_'))}.png" class="px-5 py-2.5 rounded-xl bg-amber-500 text-slate-950 text-xs font-bold">Unduh Resolusi Penuh</a>
-        </div>
-      `);
-    }
-
-    /**
-     * =========================================================================
-     * 12. EXPORT SELURUH DOKUMEN SERIAL DRAMA
-     * =========================================================================
-     */
-    function openExportModal() {
-      const proj = getActiveProject();
-      openModal(`
-        <div class="flex items-center justify-between mb-4">
-          <h3 class="font-serif font-bold text-xl">Ekspor Paket Produksi Serial Drama</h3>
-          <button onclick="closeModal()" class="p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-studio-800 text-slate-400">
-            <i data-lucide="x" class="w-5 h-5"></i>
+        <img src="${item.imageUrl}" alt="${escapeHtml(item.title)}" class="w-full max-h-[68vh] object-contain rounded-2xl bg-black mb-2">
+        <p class="text-[11px] text-slate-400 mb-4">Tips HP: Jika browser memblokir unduhan otomatis, tekan tombol <strong>Simpan / Bagikan</strong> atau tekan tahan pada gambar di atas lalu pilih <em>Simpan Gambar</em>.</p>
+        <div class="flex flex-wrap justify-end gap-2">
+          <button onclick="shareGalleryImage('${item.id}')" class="px-4 py-2.5 rounded-xl bg-slate-200 dark:bg-studio-800 text-xs font-bold flex items-center gap-1.5">
+            <i data-lucide="share-2" class="w-4 h-4"></i>
+            <span>Simpan / Bagikan ke HP</span>
           </button>
-        </div>
-        <p class="text-sm text-slate-600 dark:text-slate-300 mb-5">
-          Unduh seluruh <strong>Story Bible, Profil Karakter, Alur Serial, dan Naskah Episode</strong> untuk proyek <em>"${escapeHtml(proj.settings.title)}"</em>.
-        </p>
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <button onclick="downloadFullSeriesTxt(); closeModal();" class="p-4 rounded-2xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm flex items-center justify-center gap-2">
-            <i data-lucide="file-text" class="w-4 h-4"></i>
-            <span>Unduh Naskah Lengkap (.TXT)</span>
-          </button>
-          <button onclick="copyFullSeriesText(); closeModal();" class="p-4 rounded-2xl bg-slate-200 dark:bg-studio-800 hover:bg-slate-300 dark:hover:bg-studio-700 font-bold text-sm flex items-center justify-center gap-2">
-            <i data-lucide="copy" class="w-4 h-4"></i>
-            <span>Salin Semua ke Clipboard</span>
+          <button onclick="downloadGalleryImage('${item.id}')" class="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold flex items-center gap-1.5">
+            <i data-lucide="download" class="w-4 h-4"></i>
+            <span>Unduh Resolusi Penuh</span>
           </button>
         </div>
       `);
