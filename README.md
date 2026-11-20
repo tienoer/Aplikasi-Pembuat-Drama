@@ -219,7 +219,7 @@
      */
     const apiKey = ""; // Disediakan otomatis oleh environment saat runtime
 
-    // Daftar 15 Genre Utama + Kartu Visual SVG / Gradien
+    // Daftar 15 Genre Utama + Kartu Visual
     const GENRE_LIST = [
       { id: 'keluarga', name: 'Drama keluarga', desc: 'Konflik hangat, pengorbanan orang tua, rahasia warisan, dan ikatan darah.', gradient: 'from-amber-600 to-orange-800', icon: 'home' },
       { id: 'percintaan', name: 'Drama percintaan', desc: 'Kisah cinta penuh rintangan, pertemuan takdir, dan dilema perasaan.', gradient: 'from-rose-600 to-pink-800', icon: 'heart' },
@@ -235,7 +235,7 @@
       { id: 'horor', name: 'Drama horor', desc: 'Teror supranatural yang berakar pada kutukan keluarga dan rahasia kelam.', gradient: 'from-red-900 to-slate-950', icon: 'ghost' },
       { id: 'kerajaan', name: 'Drama kerajaan', desc: 'Intrik takhta, kesetiaan panglima, dan cinta terlarang di balik istana.', gradient: 'from-purple-700 to-amber-900', icon: 'crown' },
       { id: 'desa', name: 'Drama kehidupan desa', desc: 'Kearifan lokal, tradisi adat, dan ketenangan desa yang diuji perubahan zaman.', gradient: 'from-green-700 to-emerald-950', icon: 'trees' },
-      { id: 'sosial', name: 'Drama sosial dan konflik masyarakat', desc: 'Ketimpangan keadilan, suara rakyat kecil, dan benturan kepentingan.', gradient: 'from-slate-700 to-zinc-900', icon: 'scale' },
+      { id: 'sosial', name: 'Drama sosial dan konflik masyarakat', desc: 'Ketimpangan keadilan, suara rakyat kecil, dan benturan kepentingan.', gradient: 'from-slate-700 to-zinc-900', icon: 'scale' }
     ];
 
     // Pilihan Gaya Visual untuk Generator Gambar AI
@@ -435,8 +435,7 @@
       activeProjectId: null,
       selectedEpisodeNumber: 1,
       isEditingScript: false,
-      currentAudio: null,
-      audioPlayer: null,
+      audioBlobUrl: null,
       selectedVoice: 'Kore',
       showDashboardGuide: true
     };
@@ -684,52 +683,147 @@
       return JSON.parse(cleanJson);
     }
 
-    async function callGeminiImage({ prompt, referenceImages = [], aspectRatio = '3:4', useAdvanced = true }) {
-      const modelName = useAdvanced ? 'gemini-3.1-flash-image' : 'gemini-3.1-flash-lite-image';
-      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
-
-      const parts = [{ text: prompt }];
-      (referenceImages || []).forEach(dataUrl => {
-        if (typeof dataUrl === 'string' && dataUrl.startsWith('data:image/')) {
-          const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,(.+)$/);
-          if (match) {
-            parts.push({
-              inlineData: {
-                mimeType: match[1],
-                data: match[2]
+    function compressDataUrlForReference(dataUrl, maxDim = 512) {
+      return new Promise((resolve) => {
+        if (!dataUrl || typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/')) {
+          resolve(null);
+          return;
+        }
+        const img = new Image();
+        img.onload = () => {
+          try {
+            let w = img.width || maxDim;
+            let h = img.height || maxDim;
+            if (w > maxDim || h > maxDim) {
+              if (w >= h) {
+                h = Math.round((h * maxDim) / w);
+                w = maxDim;
+              } else {
+                w = Math.round((w * maxDim) / h);
+                h = maxDim;
               }
-            });
+            }
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, w, h);
+            resolve(canvas.toDataURL('image/jpeg', 0.82));
+          } catch (e) {
+            resolve(dataUrl);
+          }
+        };
+        img.onerror = () => resolve(null);
+        img.src = dataUrl;
+      });
+    }
+
+    function extractImageDataUrlFromResult(result) {
+      const candidate = result?.candidates?.[0];
+      const parts = candidate?.content?.parts || [];
+      const imageParts = parts.filter(p => p.inlineData && p.inlineData.data);
+      const imgPart = imageParts.length > 0 ? imageParts[imageParts.length - 1] : null;
+      if (imgPart) {
+        return `data:${imgPart.inlineData.mimeType || 'image/png'};base64,${imgPart.inlineData.data}`;
+      }
+      const textMsg = parts.find(p => p.text)?.text;
+      if (textMsg) {
+        throw new Error(textMsg.slice(0, 160));
+      }
+      if (candidate?.finishReason && candidate.finishReason !== 'STOP') {
+        throw new Error(`Permintaan visual dibatasi oleh filter keamanan (${candidate.finishReason}). Coba perhalus deskripsi adegan.`);
+      }
+      return null;
+    }
+
+    async function callGeminiImage({ prompt, referenceImages = [], aspectRatio = '3:4', useAdvanced = true }) {
+      const safePrompt = `${prompt}\nProduction guideline: PG-13 cinematic drama artwork, safe for general audience, artistic cinematography, no graphic violence or gore.`;
+
+      const compressedRefs = [];
+      for (const rawUrl of (referenceImages || []).slice(0, 2)) {
+        const comp = await compressDataUrlForReference(rawUrl, 512);
+        if (comp) compressedRefs.push(comp);
+      }
+
+      const refParts = [];
+      compressedRefs.forEach(dataUrl => {
+        const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,(.+)$/);
+        if (match) {
+          refParts.push({
+            inlineData: {
+              mimeType: match[1],
+              data: match[2]
+            }
+          });
+        }
+      });
+
+      const attempts = [];
+      if (useAdvanced) {
+        attempts.push({
+          model: 'gemini-3.1-flash-image',
+          payload: {
+            contents: [{ role: 'user', parts: [{ text: safePrompt }, ...refParts] }],
+            generationConfig: {
+              responseModalities: ['TEXT', 'IMAGE'],
+              imageConfig: { aspectRatio }
+            }
+          }
+        });
+        if (refParts.length > 0) {
+          attempts.push({
+            model: 'gemini-3.1-flash-image',
+            payload: {
+              contents: [{ role: 'user', parts: [{ text: safePrompt }] }],
+              generationConfig: {
+                responseModalities: ['TEXT', 'IMAGE'],
+                imageConfig: { aspectRatio }
+              }
+            }
+          });
+        }
+      }
+
+      attempts.push({
+        model: 'gemini-3.1-flash-lite-image',
+        payload: {
+          contents: [{ parts: [{ text: safePrompt }] }],
+          generationConfig: {
+            responseModalities: ['TEXT', 'IMAGE']
           }
         }
       });
 
-      const payload = {
-        contents: [{ role: 'user', parts }],
-        generationConfig: {
-          responseModalities: ['IMAGE'],
-          imageConfig: { aspectRatio }
+      let lastError = null;
+      for (const attempt of attempts) {
+        try {
+          const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${attempt.model}:generateContent?key=${apiKey}`;
+          const result = await fetchWithBackoff(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(attempt.payload)
+          }, 1);
+
+          const extractedUrl = extractImageDataUrlFromResult(result);
+          if (extractedUrl) {
+            return extractedUrl;
+          }
+        } catch (err) {
+          lastError = err;
         }
-      };
-
-      const result = await fetchWithBackoff(apiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-
-      const imgPart = result?.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
-      if (!imgPart || !imgPart.inlineData?.data) {
-        throw new Error('Gambar tidak dihasilkan oleh AI.');
       }
-      return `data:${imgPart.inlineData.mimeType || 'image/png'};base64,${imgPart.inlineData.data}`;
+
+      throw lastError || new Error('Gambar tidak dihasilkan oleh AI. Silakan coba lagi.');
     }
 
+    /**
+     * =========================================================================
+     * 5. KONVERSI & PEMUTAR AUDIO TTS (GEMINI TTS + CADANGAN BROWSER)
+     * =========================================================================
+     */
     function base64ToArrayBuffer(base64) {
-      const sanitized = String(base64 || '')
-        .replace(/-/g, '+')
-        .replace(/_/g, '/')
-        .replace(/\s+/g, '');
-      const binaryString = atob(sanitized);
+      const cleanBase64 = String(base64 || '').replace(/\s+/g, '');
+      const binaryString = window.atob(cleanBase64);
       const len = binaryString.length;
       const bytes = new Uint8Array(len);
       for (let i = 0; i < len; i++) {
@@ -738,844 +832,154 @@
       return bytes.buffer;
     }
 
-    function pcmToWav(pcm16, sampleRate = 24000) {
-      const numChannels = 1;
-      const bytesPerSample = 2;
-      const blockAlign = numChannels * bytesPerSample;
-      const byteRate = sampleRate * blockAlign;
-      const dataSize = pcm16.length * bytesPerSample;
-      const buffer = new ArrayBuffer(44 + dataSize);
+    function pcmToWavBlob(pcmBuffer, sampleRate = 24000, numChannels = 1) {
+      const dataLength = pcmBuffer.byteLength;
+      const buffer = new ArrayBuffer(44 + dataLength);
       const view = new DataView(buffer);
 
-      function writeStr(offset, str) {
+      function writeString(offset, str) {
         for (let i = 0; i < str.length; i++) {
           view.setUint8(offset + i, str.charCodeAt(i));
         }
       }
 
-      writeStr(0, 'RIFF');
-      view.setUint32(4, 36 + dataSize, true);
-      writeStr(8, 'WAVE');
-      writeStr(12, 'fmt ');
+      writeString(0, 'RIFF');
+      view.setUint32(4, 36 + dataLength, true);
+      writeString(8, 'WAVE');
+      writeString(12, 'fmt ');
       view.setUint32(16, 16, true);
       view.setUint16(20, 1, true);
       view.setUint16(22, numChannels, true);
       view.setUint32(24, sampleRate, true);
-      view.setUint32(28, byteRate, true);
-      view.setUint16(32, blockAlign, true);
+      view.setUint32(28, sampleRate * numChannels * 2, true);
+      view.setUint16(32, numChannels * 2, true);
       view.setUint16(34, 16, true);
-      writeStr(36, 'data');
-      view.setUint32(40, dataSize, true);
+      writeString(36, 'data');
+      view.setUint32(40, dataLength, true);
 
-      let offset = 44;
-      for (let i = 0; i < pcm16.length; i++, offset += 2) {
-        view.setInt16(offset, pcm16[i], true);
-      }
+      const pcmBytes = new Uint8Array(pcmBuffer);
+      const wavBytes = new Uint8Array(buffer, 44);
+      wavBytes.set(pcmBytes);
 
       return new Blob([buffer], { type: 'audio/wav' });
     }
 
-    async function callGeminiTTS(text, voiceName = 'Kore') {
-      const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
-      const cleanText = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 1200);
-      const payload = {
-        contents: [{
-          parts: [{ text: `Bacakan naskah drama Indonesia berikut dengan intonasi emosional dan dramatis: ${cleanText}` }]
-        }],
-        generationConfig: {
-          responseModalities: ["AUDIO"],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName }
+    function speakWithBrowserFallback(text) {
+      if (!('speechSynthesis' in window)) {
+        showToast('Browser Anda tidak mendukung pemutaran suara cadangan.', 'error');
+        return;
+      }
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'id-ID';
+      utterance.rate = 0.96;
+      const voices = window.speechSynthesis.getVoices();
+      const idVoice = voices.find(v => v.lang && v.lang.toLowerCase().includes('id'));
+      if (idVoice) utterance.voice = idVoice;
+      window.speechSynthesis.speak(utterance);
+      showToast('Memutar pembacaan naskah dengan suara Bahasa Indonesia perangkat.', 'info');
+    }
+
+    async function generateEpisodeAudio(epNum) {
+      const proj = getActiveProject();
+      const script = proj.scripts?.[epNum];
+      if (!script) {
+        showToast('Naskah episode belum tersedia.', 'warning');
+        return;
+      }
+
+      const lines = [
+        `Episode ${script.episodeNumber}: ${script.title}.`,
+        script.summary || '',
+        ...(script.scenes || []).slice(0, 3).flatMap(sc => [
+          sc.narration || '',
+          ...(sc.dialogue || []).map(d => `${d.character}: ${d.line}`)
+        ])
+      ].filter(Boolean);
+
+      const spokenText = lines.join(' ').slice(0, 2200);
+      const voiceName = appState.selectedVoice || 'Kore';
+
+      setLoading(true, 'Menyiapkan Sulih Suara AI...', `Merender pembacaan dramatis Episode ${epNum} dengan suara ${voiceName}.`);
+      try {
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
+        const payload = {
+          contents: [{
+            parts: [{
+              text: `Bacakan naskah drama Bahasa Indonesia berikut secara ekspresif, hangat, dan sinematik:\n\n${spokenText}`
+            }]
+          }],
+          generationConfig: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName }
+              }
             }
           }
-        },
-        model: "gemini-2.5-flash-preview-tts"
-      };
+        };
 
-      const result = await fetchWithBackoff(apiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
+        const result = await fetchWithBackoff(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        }, 1);
 
-      const parts = result?.candidates?.[0]?.content?.parts || [];
-      const part = parts.find(p => p.inlineData && p.inlineData.data);
-      const audioData = part?.inlineData?.data;
-      const mimeType = part?.inlineData?.mimeType || 'audio/L16;rate=24000';
-
-      if (!audioData) {
-        throw new Error('Data audio tidak ditemukan dalam respons AI.');
-      }
-
-      const rateMatch = mimeType.match(/rate=(\d+)/);
-      const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
-      const pcmBuffer = base64ToArrayBuffer(audioData);
-      const evenByteLength = pcmBuffer.byteLength - (pcmBuffer.byteLength % 2);
-      const pcm16 = new Int16Array(pcmBuffer, 0, evenByteLength / 2);
-      const wavBlob = pcmToWav(pcm16, sampleRate);
-      return URL.createObjectURL(wavBlob);
-    }
-
-    /**
-     * =========================================================================
-     * 5. MANAJEMEN PROYEK & PANDUAN PENGGUNAAN
-     * =========================================================================
-     */
-    function switchProject(projectId) {
-      appState.activeProjectId = projectId;
-      appState.selectedEpisodeNumber = 1;
-      appState.isEditingScript = false;
-      saveState();
-      renderApp();
-      showToast('Proyek berhasil dibuka.', 'info');
-    }
-
-    function openNewProjectModal() {
-      openModal(`
-        <div class="flex items-center justify-between mb-4">
-          <div class="flex items-center gap-2.5">
-            <div class="w-9 h-9 rounded-xl bg-amber-500/15 text-amber-500 flex items-center justify-center">
-              <i data-lucide="clapperboard" class="w-5 h-5"></i>
-            </div>
-            <div>
-              <h3 class="font-serif font-bold text-xl">Mulai Serial Drama Baru</h3>
-              <p class="text-xs text-slate-500 dark:text-slate-400">Tulis ide singkat atau langsung minta AI merancangnya</p>
-            </div>
-          </div>
-          <button onclick="closeModal()" class="p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-studio-800 text-slate-400">
-            <i data-lucide="x" class="w-5 h-5"></i>
-          </button>
-        </div>
-
-        <div class="space-y-4 text-sm">
-          <div>
-            <label class="block text-xs font-bold uppercase tracking-wider text-slate-500 mb-1">Judul Drama (Opsional)</label>
-            <input id="np-title" type="text" placeholder="Contoh: Cahaya di Balik Awan, Rahasia Rumah Kayu..."
-              class="w-full px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 focus:outline-none focus:border-amber-500" />
-          </div>
-
-          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-            <div>
-              <label class="block text-xs font-bold uppercase tracking-wider text-slate-500 mb-1">Pilih Genre Utama</label>
-              <select id="np-genre" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700">
-                ${GENRE_LIST.map(g => `<option value="${g.name}">${g.name}</option>`).join('')}
-              </select>
-            </div>
-            <div>
-              <label class="block text-xs font-bold uppercase tracking-wider text-slate-500 mb-1">Jumlah Episode</label>
-              <select id="np-episodes" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700">
-                <option value="3">3 Episode (Mini Seri)</option>
-                <option value="5" selected>5 Episode (Standar)</option>
-                <option value="10">10 Episode (Serial Penuh)</option>
-                <option value="15">15 Episode</option>
-                <option value="20">20 Episode</option>
-              </select>
-            </div>
-          </div>
-
-          <div>
-            <label class="block text-xs font-bold uppercase tracking-wider text-slate-500 mb-1">Ide Cerita Singkat / Premis</label>
-            <textarea id="np-idea" rows="3" placeholder="Contoh: Seorang guru muda ditugaskan di desa terpencil dan harus meyakinkan warga agar anak-anak mereka tetap bersekolah..."
-              class="w-full px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 focus:outline-none focus:border-amber-500"></textarea>
-          </div>
-        </div>
-
-        <div class="mt-6 pt-4 border-t border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row justify-end gap-2.5">
-          <button onclick="createNewProject(false)" class="px-4 py-2.5 rounded-xl bg-slate-200 dark:bg-studio-800 hover:bg-slate-300 dark:hover:bg-studio-700 font-semibold text-xs sm:text-sm">
-            Buat Proyek Kosong
-          </button>
-          <button onclick="createNewProject(true)" class="px-5 py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-xs sm:text-sm flex items-center justify-center gap-1.5 shadow-lg shadow-amber-500/20">
-            <i data-lucide="sparkles" class="w-4 h-4"></i>
-            <span>Buat & Rancang Otomatis (AI)</span>
-          </button>
-        </div>
-      `);
-    }
-
-    async function createNewProject(autoFillWithAI) {
-      const titleInput = document.getElementById('np-title').value.trim();
-      const genreInput = document.getElementById('np-genre').value;
-      const epCount = parseInt(document.getElementById('np-episodes').value, 10) || 5;
-      const ideaInput = document.getElementById('np-idea').value.trim();
-
-      const newProj = {
-        id: 'proj_' + Date.now(),
-        updatedAt: new Date().toISOString(),
-        genre: genreInput,
-        customGenre: '',
-        settings: {
-          title: titleInput || 'Serial Drama Baru',
-          theme: '',
-          synopsis: ideaInput,
-          settingPlace: 'Indonesia',
-          era: 'Masa Kini (2026)',
-          mood: 'Dramatis & Menyentuh Hati',
-          audience: 'Semua Umur / Keluarga',
-          episodeCount: epCount,
-          episodeDuration: '45 Menit (Standar TV/Streaming)',
-          narrativeStyle: 'Alur Maju Kronologis',
-          moralMessage: ''
-        },
-        characters: [],
-        storyArc: null,
-        scripts: {},
-        gallery: []
-      };
-
-      appState.projects.unshift(newProj);
-      appState.activeProjectId = newProj.id;
-      appState.selectedEpisodeNumber = 1;
-      closeModal();
-      navigateTo('setup');
-
-      if (autoFillWithAI) {
-        await aiAutoFillStorySettings(ideaInput || titleInput);
-      } else {
-        showToast('Proyek baru siap diatur!', 'success');
-      }
-    }
-
-    function toggleDashboardGuide() {
-      appState.showDashboardGuide = !appState.showDashboardGuide;
-      renderApp();
-    }
-
-    function openUserGuideModal() {
-      const steps = [
-        {
-          num: '01',
-          title: 'Mulai Proyek & Atur Genre Cerita',
-          tab: 'setup',
-          tabLabel: 'Buka Tahap 1',
-          details: [
-            'Klik tombol <strong>Mulai Membuat Drama</strong> atau <strong>Drama Baru</strong> di bagian atas.',
-            'Pilih salah satu dari <strong>15 kartu genre</strong> (seperti Drama keluarga, percintaan, misteri, kerajaan) atau ketik genre unik Anda sendiri.',
-            'Isi judul, sinopsis, latar tempat, zaman, dan jumlah episode (3, 5, 10, 15, 20, atau custom). Klik <strong>Sempurnakan & Isi Otomatis dengan AI</strong> jika ingin AI merancangnya.'
-          ]
-        },
-        {
-          num: '02',
-          title: 'Buat Karakter & Kunci Konsistensi Wajah',
-          tab: 'characters',
-          tabLabel: 'Buka Tahap 2',
-          details: [
-            'Klik <strong>Buat Karakter Otomatis (AI)</strong> agar AI menciptakan pemeran utama dan pendukung beserta latar belakangnya.',
-            'Anda juga bisa menambah, mengedit, atau menghapus karakter secara manual.',
-            '<strong>Tips Penting:</strong> Klik tombol <strong>Foto Karakter AI</strong> pada setiap kartu tokoh. Foto dan ciri pakaian ini akan dikunci sebagai referensi agar wajah tokoh tetap konsisten di semua episode.'
-          ]
-        },
-        {
-          num: '03',
-          title: 'Rancang Alur Cerita Berseri',
-          tab: 'plot',
-          tabLabel: 'Buka Tahap 3',
-          details: [
-            'Klik <strong>Buat Alur Cerita & Outline Episode (AI)</strong>.',
-            'AI akan menyusun konflik utama, konflik tambahan, klimaks, <em>plot twist</em>, penyelesaian, serta ringkasan Episode 1 hingga tamat yang saling terhubung.'
-          ]
-        },
-        {
-          num: '04',
-          title: 'Tulis & Poles Naskah Setiap Episode',
-          tab: 'script',
-          tabLabel: 'Buka Tahap 4',
-          details: [
-            'Pilih nomor episode (Ep 1, Ep 2, dst.) lalu klik <strong>Buat Episode</strong> untuk menghasilkan naskah lengkap berisi pembukaan, pembagian adegan, lokasi, dialog beremosi, arahan kamera, musik latar, dan <em>cliffhanger</em>.',
-            'Gunakan tombol kreatif seperti <strong>Buat Ulang Dialog</strong>, <strong>Perpanjang Cerita</strong>, <strong>Ubah Konflik</strong>, atau <strong>Edit Naskah</strong>.',
-            'Klik <strong>Dengarkan Pembacaan AI</strong> untuk mendengar sulih suara dramatis atau <strong>Lanjutkan ke Episode Berikutnya</strong>.'
-          ]
-        },
-        {
-          num: '05',
-          title: 'Buat Poster Utama & Ilustrasi Adegan',
-          tab: 'visuals',
-          tabLabel: 'Buka Tahap 5',
-          details: [
-            'Buka tab <strong>5. Studio Visual AI</strong> atau klik tombol <strong>Ilustrasi Adegan AI</strong> langsung di dalam naskah.',
-            'Pilih jenis gambar (<em>Poster utama serial, Foto karakter, Ilustrasi adegan, Background lokasi, Thumbnail,</em> atau <em>Sampul episode</em>) dan gaya visual favorit Anda.',
-            'Terakhir, klik ikon <strong>Unduh (Ekspor)</strong> di pojok kanan atas untuk menyimpan seluruh paket naskah drama ke format <code>.TXT</code>.'
-          ]
+        const parts = result?.candidates?.[0]?.content?.parts || [];
+        const audioPart = parts.find(p => p.inlineData && p.inlineData.data);
+        if (!audioPart) {
+          throw new Error('Data audio tidak ditemukan.');
         }
-      ];
 
-      openModal(`
-        <div class="flex items-center justify-between pb-4 mb-4 border-b border-slate-200 dark:border-slate-800">
-          <div class="flex items-center gap-2.5">
-            <div class="w-9 h-9 rounded-xl bg-amber-500/15 text-amber-500 flex items-center justify-center">
-              <i data-lucide="book-open" class="w-5 h-5"></i>
-            </div>
-            <div>
-              <h3 class="font-serif font-bold text-lg sm:text-xl text-slate-900 dark:text-white">Petunjuk Penggunaan Drama Studio AI</h3>
-              <p class="text-xs text-slate-500 dark:text-slate-400">Panduan praktis 5 langkah mewujudkan ide menjadi serial drama lengkap</p>
-            </div>
-          </div>
-          <button onclick="closeModal()" class="p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-studio-800 text-slate-400">
-            <i data-lucide="x" class="w-5 h-5"></i>
-          </button>
-        </div>
+        const mimeType = audioPart.inlineData.mimeType || '';
+        const rateMatch = mimeType.match(/rate=(\d+)/);
+        const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000;
 
-        <div class="space-y-4 max-h-[68vh] overflow-y-auto pr-1">
-          ${steps.map(st => `
-            <div class="p-4 rounded-2xl bg-slate-50 dark:bg-studio-850 border border-slate-200/80 dark:border-slate-800">
-              <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-2.5">
-                <div class="flex items-center gap-2.5">
-                  <span class="px-2.5 py-1 rounded-lg bg-amber-500 text-slate-950 font-mono font-bold text-xs">LANGKAH ${st.num}</span>
-                  <h4 class="font-serif font-bold text-base text-slate-900 dark:text-white">${st.title}</h4>
-                </div>
-                <button onclick="closeModal(); navigateTo('${st.tab}');"
-                  class="px-3 py-1.5 rounded-xl bg-amber-500/15 hover:bg-amber-500 text-amber-600 dark:text-amber-300 hover:text-slate-950 font-semibold text-xs flex items-center gap-1 transition-colors self-start sm:self-auto">
-                  <span>${st.tabLabel}</span>
-                  <i data-lucide="arrow-right" class="w-3.5 h-3.5"></i>
-                </button>
-              </div>
-              <ul class="space-y-1.5 text-xs sm:text-sm text-slate-600 dark:text-slate-300 list-disc pl-5 leading-relaxed">
-                ${st.details.map(d => `<li>${d}</li>`).join('')}
-              </ul>
-            </div>
-          `).join('')}
-        </div>
+        const arrayBuf = base64ToArrayBuffer(audioPart.inlineData.data);
+        const wavBlob = mimeType.includes('wav')
+          ? new Blob([arrayBuf], { type: 'audio/wav' })
+          : pcmToWavBlob(arrayBuf, sampleRate, 1);
 
-        <div class="mt-5 pt-4 border-t border-slate-200 dark:border-slate-800 flex justify-end gap-2">
-          <button onclick="closeModal()" class="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs sm:text-sm">
-            Mengerti, Mulai Berkarya!
-          </button>
-        </div>
-      `);
+        if (appState.audioBlobUrl) {
+          URL.revokeObjectURL(appState.audioBlobUrl);
+        }
+        appState.audioBlobUrl = URL.createObjectURL(wavBlob);
+        renderApp();
+        showToast('Audio naskah berhasil dibuat! Silakan tekan tombol Putar pada pemutar audio.', 'success');
+      } catch (err) {
+        speakWithBrowserFallback(spokenText);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    function downloadEpisodeAudioWav(epNum) {
+      if (!appState.audioBlobUrl) {
+        showToast('Silakan buat audio naskah terlebih dahulu.', 'warning');
+        return;
+      }
+      const proj = getActiveProject();
+      const slug = (proj.settings.title || 'drama').toLowerCase().replace(/[^a-z0-9]+/g, '_');
+      const a = document.createElement('a');
+      a.href = appState.audioBlobUrl;
+      a.download = `${slug}_episode_${epNum}.wav`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      showToast('Mengunduh file audio (.WAV)...', 'success');
     }
 
     /**
      * =========================================================================
-     * 6. RENDER HALAMAN A: DASHBOARD STUDIO UTAMA
+     * 6. FUNGSI GENERATOR AI UNTUK CERITA, KARAKTER, ALUR & NASKAH
      * =========================================================================
      */
-    function renderDashboardView() {
-      const activeProj = getActiveProject();
-      const allCharacters = [];
-      const allPosters = [];
-      const recentEpisodes = [];
-
-      (appState.projects || []).forEach(p => {
-        (p.characters || []).forEach(c => {
-          allCharacters.push({ ...c, projectId: p.id, projectTitle: p.settings.title });
-        });
-        (p.gallery || []).forEach(g => {
-          if (g.category.toLowerCase().includes('poster')) {
-            allPosters.push({ ...g, projectId: p.id, projectTitle: p.settings.title });
-          }
-        });
-        Object.values(p.scripts || {}).forEach(sc => {
-          recentEpisodes.push({ ...sc, projectId: p.id, projectTitle: p.settings.title });
-        });
-      });
-
-      return `
-        <div class="space-y-8 animate-fade-in">
-          <!-- HERO STUDIO BANNER -->
-          <section class="relative rounded-3xl overflow-hidden bg-gradient-to-br from-studio-900 via-studio-850 to-slate-950 border border-amber-500/25 p-6 sm:p-10 text-white shadow-2xl">
-            <div class="absolute -right-24 -top-24 w-80 h-80 rounded-full bg-amber-500/15 blur-3xl pointer-events-none"></div>
-            <div class="absolute -left-24 -bottom-24 w-72 h-72 rounded-full bg-indigo-500/15 blur-3xl pointer-events-none"></div>
-
-            <div class="relative z-10 max-w-3xl">
-              <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-500/15 border border-amber-400/30 text-amber-300 text-xs font-semibold mb-4">
-                <i data-lucide="film" class="w-3.5 h-3.5"></i>
-                <span>DRAMA STUDIO AI • STUDIO PRODUKSI SERIAL DIGITAL</span>
-              </div>
-
-              <h1 class="font-serif font-extrabold text-3xl sm:text-5xl leading-tight tracking-tight mb-4">
-                Wujudkan Ide Ceritamu Menjadi <span class="bg-gradient-to-r from-amber-300 via-amber-400 to-orange-400 bg-clip-text text-transparent">Serial Drama.</span>
-              </h1>
-
-              <p class="text-sm sm:text-base text-slate-300 leading-relaxed mb-7 max-w-2xl">
-                Rancang serial drama berseri dari satu kalimat ide menjadi karakter dengan wajah konsisten, alur cerita saling terhubung, dialog penuh emosi, poster resmi, hingga naskah video siap produksi.
-              </p>
-
-              <div class="flex flex-wrap items-center gap-3 sm:gap-4">
-                <button onclick="openNewProjectModal()" class="px-6 py-3.5 rounded-2xl bg-gradient-to-r from-amber-400 to-orange-500 hover:from-amber-300 hover:to-orange-400 text-slate-950 font-bold text-sm sm:text-base shadow-xl shadow-amber-500/25 flex items-center gap-2.5 transition-transform active:scale-95">
-                  <i data-lucide="sparkles" class="w-5 h-5"></i>
-                  <span>Mulai Membuat Drama</span>
-                </button>
-
-                ${activeProj ? `
-                  <button onclick="navigateTo('setup')" class="px-5 py-3.5 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/15 text-white font-semibold text-sm sm:text-base flex items-center gap-2.5 transition-colors">
-                    <i data-lucide="play-circle" class="w-5 h-5 text-amber-400"></i>
-                    <span>Lanjutkan Proyek: ${escapeHtml(activeProj.settings.title)}</span>
-                  </button>
-                ` : ''}
-
-                <button onclick="openUserGuideModal()" class="px-4 py-3.5 rounded-2xl bg-amber-500/15 hover:bg-amber-500/25 border border-amber-400/30 text-amber-300 font-semibold text-sm flex items-center gap-2 transition-colors">
-                  <i data-lucide="book-open" class="w-4 h-4"></i>
-                  <span>Petunjuk Penggunaan</span>
-                </button>
-              </div>
-            </div>
-          </section>
-
-          <!-- PETUNJUK PENGGUNAAN & LANGKAH-LANGKAH (UNTUK PEMULA) -->
-          <section class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 overflow-hidden shadow-sm">
-            <div class="px-5 sm:px-6 py-4 bg-gradient-to-r from-amber-500/10 via-orange-500/5 to-transparent border-b border-slate-200/80 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3">
-              <div class="flex items-center gap-3">
-                <div class="w-9 h-9 rounded-xl bg-amber-500 text-slate-950 flex items-center justify-center shrink-0">
-                  <i data-lucide="compass" class="w-5 h-5"></i>
-                </div>
-                <div>
-                  <h2 class="font-serif font-bold text-base sm:text-lg text-slate-900 dark:text-white">Petunjuk Penggunaan & Langkah-Langkah Membuat Serial</h2>
-                  <p class="text-xs text-slate-500 dark:text-slate-400">Ikuti 5 langkah berurutan di bawah ini untuk menghasilkan serial drama lengkap dari nol</p>
-                </div>
-              </div>
-              <div class="flex items-center gap-2">
-                <button onclick="openUserGuideModal()" class="px-3 py-1.5 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 text-amber-600 dark:text-amber-300 text-xs font-semibold transition-colors">
-                  Panduan Detail
-                </button>
-                <button onclick="toggleDashboardGuide()" class="px-3 py-1.5 rounded-xl bg-slate-100 dark:bg-studio-800 hover:bg-slate-200 dark:hover:bg-studio-700 text-xs font-semibold flex items-center gap-1 transition-colors">
-                  <span>${appState.showDashboardGuide ? 'Sembunyikan' : 'Tampilkan'}</span>
-                  <i data-lucide="${appState.showDashboardGuide ? 'chevron-up' : 'chevron-down'}" class="w-3.5 h-3.5"></i>
-                </button>
-              </div>
-            </div>
-
-            ${appState.showDashboardGuide ? `
-              <div class="p-5 sm:p-6">
-                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3.5">
-                  ${[
-                    {
-                      step: 'Langkah 1',
-                      title: 'Pilih Genre & Cerita',
-                      desc: 'Klik "Mulai Membuat Drama", pilih dari 15+ genre, lalu isi pengaturan cerita atau gunakan tombol Isi Otomatis AI.',
-                      tab: 'setup',
-                      icon: 'clapperboard'
-                    },
-                    {
-                      step: 'Langkah 2',
-                      title: 'Buat Karakter Konsisten',
-                      desc: 'Generate karakter otomatis dan klik "Foto Karakter AI" agar wajah & pakaian tokoh tetap konsisten di semua episode.',
-                      tab: 'characters',
-                      icon: 'users'
-                    },
-                    {
-                      step: 'Langkah 3',
-                      title: 'Susun Alur Berseri',
-                      desc: 'Generate konflik utama, klimaks, plot twist, serta ringkasan Episode 1 sampai tamat yang saling terhubung.',
-                      tab: 'plot',
-                      icon: 'git-branch'
-                    },
-                    {
-                      step: 'Langkah 4',
-                      title: 'Tulis Naskah Episode',
-                      desc: 'Buat dialog lengkap, arahan kamera, dan musik. Gunakan tombol Ubah Konflik, Perpanjang Cerita, atau Audio AI.',
-                      tab: 'script',
-                      icon: 'file-text'
-                    },
-                    {
-                      step: 'Langkah 5',
-                      title: 'Poster, Visual & Ekspor',
-                      desc: 'Ciptakan poster resmi dan ilustrasi adegan multi-gaya, lalu unduh paket naskah lengkap (.TXT) di pojok kanan atas.',
-                      tab: 'visuals',
-                      icon: 'image'
-                    }
-                  ].map(item => `
-                    <button onclick="navigateTo('${item.tab}')" class="p-4 rounded-2xl bg-slate-50 dark:bg-studio-850 border border-slate-200/80 dark:border-slate-800 hover:border-amber-500/60 text-left transition-all group flex flex-col justify-between">
-                      <div>
-                        <div class="flex items-center justify-between mb-2">
-                          <span class="px-2 py-0.5 rounded-md bg-amber-500/15 text-[10px] font-bold uppercase tracking-wider text-amber-600 dark:text-amber-400">${item.step}</span>
-                          <i data-lucide="${item.icon}" class="w-4 h-4 text-slate-400 group-hover:text-amber-400 transition-colors"></i>
-                        </div>
-                        <div class="font-bold text-sm text-slate-900 dark:text-white mb-1.5 group-hover:text-amber-500 transition-colors">${item.title}</div>
-                        <p class="text-xs text-slate-600 dark:text-slate-400 leading-relaxed mb-3">${item.desc}</p>
-                      </div>
-                      <div class="text-[11px] font-semibold text-amber-600 dark:text-amber-400 flex items-center gap-1 pt-2 border-t border-slate-200/60 dark:border-slate-800">
-                        <span>Mulai tahap ini</span>
-                        <i data-lucide="arrow-right" class="w-3 h-3 group-hover:translate-x-0.5 transition-transform"></i>
-                      </div>
-                    </button>
-                  `).join('')}
-                </div>
-              </div>
-            ` : ''}
-          </section>
-
-          <!-- DRAMA YANG PERNAH DIBUAT -->
-          <section>
-            <div class="flex items-center justify-between mb-4">
-              <div>
-                <h2 class="font-serif font-bold text-xl sm:text-2xl text-slate-900 dark:text-white">Drama yang Pernah Dibuat</h2>
-                <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400">Pilih serial drama untuk melanjutkan penulisan atau produksi visual.</p>
-              </div>
-              <button onclick="openNewProjectModal()" class="text-xs sm:text-sm font-semibold text-amber-600 dark:text-amber-400 hover:underline flex items-center gap-1">
-                <i data-lucide="plus" class="w-4 h-4"></i> Tambah Proyek
-              </button>
-            </div>
-
-            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-              ${appState.projects.map(proj => {
-                const isSelected = proj.id === activeProj?.id;
-                const scriptCount = Object.keys(proj.scripts || {}).length;
-                const poster = (proj.gallery || []).find(g => g.imageUrl && g.category.toLowerCase().includes('poster'));
-                return `
-                  <div class="rounded-3xl bg-white dark:bg-studio-900 border ${isSelected ? 'border-amber-500 ring-2 ring-amber-500/20' : 'border-slate-200 dark:border-slate-800'} overflow-hidden flex flex-col shadow-sm hover:shadow-xl transition-all">
-                    <div class="h-40 relative bg-gradient-to-br from-slate-800 via-studio-850 to-amber-950 p-5 flex flex-col justify-between overflow-hidden">
-                      ${poster ? `<img src="${poster.imageUrl}" alt="${escapeHtml(proj.settings.title)}" class="absolute inset-0 w-full h-full object-cover opacity-55">` : ''}
-                      <div class="absolute inset-0 bg-gradient-to-t from-studio-950 via-studio-950/40 to-transparent"></div>
-                      <div class="relative z-10 flex items-center justify-between">
-                        <span class="px-2.5 py-1 rounded-full text-[11px] font-semibold bg-amber-500/20 text-amber-300 border border-amber-400/30 backdrop-blur-md">
-                          ${escapeHtml(proj.customGenre || proj.genre)}
-                        </span>
-                        ${isSelected ? `<span class="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500 text-slate-950">AKTIF</span>` : ''}
-                      </div>
-                      <div class="relative z-10">
-                        <h3 class="font-serif font-bold text-lg text-white line-clamp-1">${escapeHtml(proj.settings.title)}</h3>
-                        <p class="text-xs text-slate-300">${proj.settings.episodeCount} Episode • ${escapeHtml(proj.settings.episodeDuration)}</p>
-                      </div>
-                    </div>
-
-                    <div class="p-5 flex-1 flex flex-col justify-between gap-4">
-                      <p class="text-xs sm:text-sm text-slate-600 dark:text-slate-300 line-clamp-3 leading-relaxed">
-                        ${escapeHtml(proj.settings.synopsis || 'Belum ada sinopsis. Klik lanjutkan untuk mulai merancang cerita.')}
-                      </p>
-
-                      <div class="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 pt-3 border-t border-slate-100 dark:border-slate-800">
-                        <span>${(proj.characters || []).length} Karakter</span>
-                        <span>${scriptCount}/${proj.settings.episodeCount} Naskah</span>
-                      </div>
-
-                      <div class="flex items-center gap-2">
-                        <button onclick="switchProject('${proj.id}'); navigateTo('setup');" class="flex-1 py-2.5 px-4 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold text-xs sm:text-sm transition-colors flex items-center justify-center gap-1.5">
-                          <span>Lanjutkan Proyek</span>
-                          <i data-lucide="arrow-right" class="w-4 h-4"></i>
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                `;
-              }).join('')}
-            </div>
-          </section>
-
-          <!-- KOLEKSI KARAKTER, POSTER & EPISODE TERBARU -->
-          <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <!-- KOLEKSI KARAKTER -->
-            <section class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-5">
-              <div class="flex items-center justify-between mb-4">
-                <h3 class="font-serif font-bold text-lg flex items-center gap-2">
-                  <i data-lucide="users" class="w-5 h-5 text-amber-500"></i>
-                  <span>Koleksi Karakter</span>
-                </h3>
-                <button onclick="navigateTo('characters')" class="text-xs font-semibold text-amber-500 hover:underline">Kelola</button>
-              </div>
-              <div class="space-y-3">
-                ${allCharacters.length === 0 ? `<p class="text-xs text-slate-500">Belum ada karakter dibuat.</p>` :
-                  allCharacters.slice(0, 4).map(c => `
-                    <div onclick="switchProject('${c.projectId}'); navigateTo('characters');" class="flex items-center gap-3 p-2.5 rounded-2xl bg-slate-50 dark:bg-studio-850 hover:bg-amber-500/10 cursor-pointer transition-colors border border-slate-200/70 dark:border-slate-800">
-                      ${c.imageUrl
-                        ? `<img src="${c.imageUrl}" alt="${escapeHtml(c.name)}" class="w-12 h-12 rounded-xl object-cover border border-amber-500/30 shrink-0">`
-                        : `<div class="w-12 h-12 rounded-xl bg-gradient-to-br from-amber-500/20 to-indigo-500/20 border border-amber-500/30 flex items-center justify-center font-serif font-bold text-amber-400 shrink-0">${escapeHtml(c.name.charAt(0))}</div>`
-                      }
-                      <div class="min-w-0 flex-1">
-                        <div class="font-bold text-sm truncate">${escapeHtml(c.name)}</div>
-                        <div class="text-xs text-amber-600 dark:text-amber-400 truncate">${escapeHtml(c.role)}</div>
-                        <div class="text-[11px] text-slate-500 truncate">${escapeHtml(c.projectTitle)}</div>
-                      </div>
-                    </div>
-                  `).join('')
-                }
-              </div>
-            </section>
-
-            <!-- KOLEKSI POSTER -->
-            <section class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-5">
-              <div class="flex items-center justify-between mb-4">
-                <h3 class="font-serif font-bold text-lg flex items-center gap-2">
-                  <i data-lucide="image" class="w-5 h-5 text-amber-500"></i>
-                  <span>Koleksi Poster</span>
-                </h3>
-                <button onclick="navigateTo('visuals')" class="text-xs font-semibold text-amber-500 hover:underline">Studio Visual</button>
-              </div>
-              <div class="grid grid-cols-2 gap-3">
-                ${allPosters.slice(0, 4).map(p => `
-                  <div onclick="switchProject('${p.projectId}'); navigateTo('visuals');" class="group relative aspect-[3/4] rounded-2xl overflow-hidden bg-gradient-to-br from-amber-900 via-studio-900 to-slate-950 border border-slate-700 cursor-pointer">
-                    ${p.imageUrl
-                      ? `<img src="${p.imageUrl}" alt="${escapeHtml(p.title)}" class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300">`
-                      : `<div class="w-full h-full p-3 flex flex-col justify-between bg-gradient-to-b from-amber-500/10 to-studio-950">
-                          <span class="text-[9px] uppercase tracking-widest text-amber-400 font-bold">POSTER SERIAL</span>
-                          <div>
-                            <div class="font-serif font-bold text-xs text-white leading-snug mb-1">${escapeHtml(p.projectTitle)}</div>
-                            <span class="text-[10px] text-amber-300 underline">Klik buat gambar AI</span>
-                          </div>
-                        </div>`
-                    }
-                  </div>
-                `).join('')}
-              </div>
-            </section>
-
-            <!-- EPISODE TERBARU -->
-            <section class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-5">
-              <div class="flex items-center justify-between mb-4">
-                <h3 class="font-serif font-bold text-lg flex items-center gap-2">
-                  <i data-lucide="film" class="w-5 h-5 text-amber-500"></i>
-                  <span>Episode Terbaru</span>
-                </h3>
-                <button onclick="navigateTo('script')" class="text-xs font-semibold text-amber-500 hover:underline">Buka Naskah</button>
-              </div>
-              <div class="space-y-3">
-                ${recentEpisodes.length === 0 ? `<p class="text-xs text-slate-500">Belum ada naskah episode ditulis.</p>` :
-                  recentEpisodes.slice(0, 4).map(ep => `
-                    <div onclick="switchProject('${ep.projectId}'); appState.selectedEpisodeNumber=${ep.episodeNumber}; navigateTo('script');" class="p-3 rounded-2xl bg-slate-50 dark:bg-studio-850 hover:bg-amber-500/10 border border-slate-200/70 dark:border-slate-800 cursor-pointer transition-colors">
-                      <div class="flex items-center justify-between mb-1">
-                        <span class="text-[11px] font-bold text-amber-600 dark:text-amber-400">EPISODE ${ep.episodeNumber}</span>
-                        <span class="text-[10px] text-slate-400">${escapeHtml(ep.projectTitle)}</span>
-                      </div>
-                      <div class="font-bold text-sm mb-1">${escapeHtml(ep.title)}</div>
-                      <p class="text-xs text-slate-500 dark:text-slate-400 line-clamp-2">${escapeHtml(ep.summary)}</p>
-                    </div>
-                  `).join('')
-                }
-              </div>
-            </section>
-          </div>
-        </div>
-      `;
-    }
-
-    /**
-     * =========================================================================
-     * 7. RENDER HALAMAN B & C: PILIHAN GENRE & PENGATURAN CERITA
-     * =========================================================================
-     */
-    function renderSetupView() {
+    async function aiAutoFillStorySettings() {
       const proj = getActiveProject();
-      const s = proj.settings;
-      const presetCounts = [3, 5, 10, 15, 20];
-      const isCustomCount = !presetCounts.includes(Number(s.episodeCount));
+      const activeGenre = proj.customGenre.trim() || proj.genre || 'Drama keluarga';
+      const currentIdea = proj.settings.synopsis || proj.settings.title || '';
 
-      return `
-        <div class="space-y-8 animate-fade-in">
-          <!-- Header Section -->
-          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-            <div>
-              <span class="text-xs font-bold uppercase tracking-wider text-amber-500">Tahap 1 • Konsep & Pondasi Cerita</span>
-              <h1 class="font-serif font-bold text-2xl sm:text-3xl mt-1">Pilihan Genre & Pengaturan Serial</h1>
-            </div>
-            <button onclick="aiAutoFillStorySettings()" class="px-5 py-3 rounded-2xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-xs sm:text-sm shadow-lg shadow-amber-500/20 flex items-center justify-center gap-2">
-              <i data-lucide="wand-2" class="w-4 h-4"></i>
-              <span>Sempurnakan & Isi Otomatis dengan AI</span>
-            </button>
-          </div>
-
-          <!-- B. PILIHAN GENRE DRAMA (15 KARTU BERGAMBAR + GENRE KUSTOM) -->
-          <section class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-5 sm:p-6">
-            <h2 class="font-serif font-bold text-xl mb-1">B. Pilih Genre Drama</h2>
-            <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mb-5">Pilih salah satu dari 15 genre drama unggulan atau ciptakan genre unik Anda sendiri.</p>
-
-            <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 sm:gap-4 mb-5">
-              ${GENRE_LIST.map(g => {
-                const isSelected = !proj.customGenre && proj.genre === g.name;
-                return `
-                  <button onclick="selectGenre('${g.name}')"
-                    class="group relative rounded-2xl overflow-hidden text-left border-2 transition-all flex flex-col justify-between h-36 sm:h-40 p-3.5 ${
-                      isSelected
-                        ? 'border-amber-400 ring-4 ring-amber-500/20 scale-[1.02]'
-                        : 'border-transparent hover:border-amber-500/50'
-                    }">
-                    <div class="absolute inset-0 bg-gradient-to-br ${g.gradient} opacity-90 group-hover:opacity-100 transition-opacity"></div>
-                    <svg class="absolute -right-4 -bottom-4 w-24 h-24 text-white/10" viewBox="0 0 100 100" fill="currentColor">
-                      <circle cx="50" cy="50" r="45"/>
-                    </svg>
-
-                    <div class="relative z-10 flex items-center justify-between">
-                      <div class="w-8 h-8 rounded-xl bg-black/25 backdrop-blur-sm flex items-center justify-center text-white">
-                        <i data-lucide="${g.icon}" class="w-4 h-4"></i>
-                      </div>
-                      ${isSelected ? `<span class="w-6 h-6 rounded-full bg-amber-400 text-slate-950 flex items-center justify-center"><i data-lucide="check" class="w-3.5 h-3.5"></i></span>` : ''}
-                    </div>
-
-                    <div class="relative z-10">
-                      <div class="font-bold text-xs sm:text-sm text-white leading-snug mb-1">${g.name}</div>
-                      <p class="text-[10px] text-white/80 line-clamp-2 leading-tight">${g.desc}</p>
-                    </div>
-                  </button>
-                `;
-              }).join('')}
-            </div>
-
-            <!-- Custom Genre Input -->
-            <div class="p-4 rounded-2xl bg-slate-50 dark:bg-studio-850 border border-slate-200 dark:border-slate-700/80 flex flex-col sm:flex-row sm:items-center gap-3">
-              <div class="flex items-center gap-2 text-sm font-semibold text-amber-600 dark:text-amber-400 shrink-0">
-                <i data-lucide="sparkles" class="w-4 h-4"></i>
-                <span>Atau Buat Genre Sendiri:</span>
-              </div>
-              <input type="text" id="input-custom-genre" value="${escapeHtml(proj.customGenre || '')}"
-                oninput="updateCustomGenre(this.value)"
-                placeholder="Contoh: Drama Kuliner & Warisan Keluarga, Drama Sci-Fi Nusantara..."
-                class="flex-1 px-4 py-2.5 rounded-xl bg-white dark:bg-studio-900 border border-slate-300 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500" />
-            </div>
-          </section>
-
-          <!-- C. PENGATURAN CERITA -->
-          <section class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-5 sm:p-6">
-            <h2 class="font-serif font-bold text-xl mb-1">C. Pengaturan Cerita & Bible Serial</h2>
-            <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mb-6">Tentukan identitas, latar dunia, dan struktur episode serial drama Anda.</p>
-
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
-              <!-- Judul Drama -->
-              <div>
-                <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">Judul Drama</label>
-                <input type="text" value="${escapeHtml(s.title)}" onchange="updateSetting('title', this.value)"
-                  placeholder="Masukkan judul serial drama..."
-                  class="w-full px-4 py-3 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm font-semibold focus:outline-none focus:border-amber-500" />
-              </div>
-
-              <!-- Tema Utama -->
-              <div>
-                <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">Tema Utama</label>
-                <input type="text" value="${escapeHtml(s.theme)}" onchange="updateSetting('theme', this.value)"
-                  placeholder="Contoh: Pengorbanan seorang ibu, Kesetiaan di tengah ujian..."
-                  class="w-full px-4 py-3 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500" />
-              </div>
-
-              <!-- Sinopsis Cerita (Full Width) -->
-              <div class="md:col-span-2">
-                <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">Sinopsis Cerita</label>
-                <textarea rows="4" onchange="updateSetting('synopsis', this.value)"
-                  placeholder="Tuliskan premis atau ringkasan cerita serial drama Anda..."
-                  class="w-full px-4 py-3 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm leading-relaxed focus:outline-none focus:border-amber-500">${escapeHtml(s.synopsis)}</textarea>
-              </div>
-
-              <!-- Latar Tempat -->
-              <div>
-                <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">Latar Tempat</label>
-                <input type="text" value="${escapeHtml(s.settingPlace)}" onchange="updateSetting('settingPlace', this.value)"
-                  placeholder="Contoh: Desa Lereng Merapi, Jakarta, Pelabuhan Tua..."
-                  class="w-full px-4 py-3 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500" />
-              </div>
-
-              <!-- Zaman Cerita -->
-              <div>
-                <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">Zaman Cerita</label>
-                <input type="text" value="${escapeHtml(s.era)}" onchange="updateSetting('era', this.value)"
-                  placeholder="Contoh: Masa Kini, Tahun 1998, Era Kerajaan Majapahit..."
-                  class="w-full px-4 py-3 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500" />
-              </div>
-
-              <!-- Suasana Cerita -->
-              <div>
-                <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">Suasana Cerita</label>
-                <input type="text" value="${escapeHtml(s.mood)}" onchange="updateSetting('mood', this.value)"
-                  placeholder="Contoh: Hangat & Mengharukan, Tegang & Misterius..."
-                  class="w-full px-4 py-3 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500" />
-              </div>
-
-              <!-- Target Penonton -->
-              <div>
-                <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">Target Penonton</label>
-                <select onchange="updateSetting('audience', this.value)"
-                  class="w-full px-4 py-3 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500">
-                  ${['Semua Umur / Keluarga', 'Remaja & Dewasa Muda (15+)', 'Dewasa (18+)', 'Anak & Keluarga'].map(opt =>
-                    `<option value="${opt}" ${s.audience === opt ? 'selected' : ''}>${opt}</option>`
-                  ).join('')}
-                </select>
-              </div>
-
-              <!-- Jumlah Episode (3, 5, 10, 15, 20, atau Custom) -->
-              <div>
-                <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">Jumlah Episode</label>
-                <div class="flex flex-wrap items-center gap-2">
-                  ${presetCounts.map(num => `
-                    <button type="button" onclick="updateSetting('episodeCount', ${num}); renderApp();"
-                      class="px-3.5 py-2.5 rounded-xl text-xs font-bold border transition-all ${
-                        Number(s.episodeCount) === num
-                          ? 'bg-amber-500 text-slate-950 border-amber-500'
-                          : 'bg-slate-50 dark:bg-studio-850 border-slate-300 dark:border-slate-700 hover:border-amber-500'
-                      }">
-                      ${num} Ep
-                    </button>
-                  `).join('')}
-                  <div class="flex items-center gap-1.5">
-                    <input type="number" min="1" max="50" value="${s.episodeCount}"
-                      onchange="updateSetting('episodeCount', Math.max(1, Math.min(50, parseInt(this.value) || 5))); renderApp();"
-                      class="w-20 px-3 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border ${isCustomCount ? 'border-amber-500' : 'border-slate-300 dark:border-slate-700'} text-xs font-bold text-center focus:outline-none focus:border-amber-500"
-                      title="Custom jumlah episode" />
-                    <span class="text-xs text-slate-400">Custom</span>
-                  </div>
-                </div>
-              </div>
-
-              <!-- Durasi Setiap Episode -->
-              <div>
-                <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">Durasi Setiap Episode</label>
-                <select onchange="updateSetting('episodeDuration', this.value)"
-                  class="w-full px-4 py-3 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500">
-                  ${['10 Menit (Web Series Pendek)', '20 Menit', '30 Menit', '45 Menit (Standar TV/Streaming)', '60 Menit (Drama Panjang)'].map(opt =>
-                    `<option value="${opt}" ${s.episodeDuration === opt ? 'selected' : ''}>${opt}</option>`
-                  ).join('')}
-                </select>
-              </div>
-
-              <!-- Gaya Penceritaan -->
-              <div>
-                <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">Gaya Penceritaan</label>
-                <select onchange="updateSetting('narrativeStyle', this.value)"
-                  class="w-full px-4 py-3 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500">
-                  ${[
-                    'Alur Maju Kronologis',
-                    'Alur Maju dengan Kilas Balik Emosional',
-                    'Multi-Perspektif Antar Tokoh',
-                    'Narasi Puitis & Kontemplatif',
-                    'Cepat, Intens & Penuh Kejutan'
-                  ].map(opt =>
-                    `<option value="${opt}" ${s.narrativeStyle === opt ? 'selected' : ''}>${opt}</option>`
-                  ).join('')}
-                </select>
-              </div>
-
-              <!-- Pesan Moral -->
-              <div>
-                <label class="block text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">Pesan Moral</label>
-                <input type="text" value="${escapeHtml(s.moralMessage)}" onchange="updateSetting('moralMessage', this.value)"
-                  placeholder="Nilai kehidupan yang ingin disampaikan kepada penonton..."
-                  class="w-full px-4 py-3 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500" />
-              </div>
-            </div>
-
-            <div class="mt-7 pt-5 border-t border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-3">
-              <span class="text-xs text-slate-500">Lanjutkan ke tahap pembuatan karakter setelah mengatur cerita.</span>
-              <button onclick="navigateTo('characters')" class="w-full sm:w-auto px-6 py-3 rounded-2xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm flex items-center justify-center gap-2 transition-colors">
-                <span>Lanjut ke Studio Karakter</span>
-                <i data-lucide="arrow-right" class="w-4 h-4"></i>
-              </button>
-            </div>
-          </section>
-        </div>
-      `;
-    }
-
-    function selectGenre(genreName) {
-      const proj = getActiveProject();
-      proj.genre = genreName;
-      proj.customGenre = '';
-      saveState();
-      renderApp();
-    }
-
-    function updateCustomGenre(val) {
-      const proj = getActiveProject();
-      proj.customGenre = val;
-      saveState();
-    }
-
-    function updateSetting(key, val) {
-      const proj = getActiveProject();
-      proj.settings[key] = val;
-      saveState();
-      updateHeaderAndNav();
-    }
-
-    async function aiAutoFillStorySettings(seedIdea = '') {
-      const proj = getActiveProject();
-      const activeGenre = proj.customGenre || proj.genre;
-      const currentIdea = seedIdea || proj.settings.synopsis || proj.settings.title;
-
-      setLoading(true, 'Merancang Konsep Serial Drama...', 'AI sedang menyusun judul, sinopsis, latar tempat, suasana, dan pesan moral yang kuat.');
+      setLoading(true, 'Merancang Konsep Serial Drama...', `AI sedang mengembangkan ide cerita untuk genre "${activeGenre}".`);
       try {
         const schema = {
           type: "OBJECT",
@@ -1586,207 +990,90 @@
             settingPlace: { type: "STRING" },
             era: { type: "STRING" },
             mood: { type: "STRING" },
+            audience: { type: "STRING" },
+            narrativeStyle: { type: "STRING" },
             moralMessage: { type: "STRING" }
           },
-          required: ["title", "theme", "synopsis", "settingPlace", "era", "mood", "moralMessage"]
+          required: ["title", "theme", "synopsis", "settingPlace", "era", "mood", "audience", "narrativeStyle", "moralMessage"]
         };
 
         const data = await callGeminiText({
-          systemPrompt: 'Kamu adalah Showrunner dan Penulis Utama serial drama Indonesia pemenang penghargaan. Buat konsep serial drama yang menyentuh, autentik, dan memikat dalam bahasa Indonesia.',
-          userPrompt: `Buatkan konsep lengkap serial drama dengan genre "${activeGenre}". Ide awal/referensi: "${currentIdea || 'Buat ide orisinal yang sangat menyentuh'}". Jumlah episode direncanakan: ${proj.settings.episodeCount} episode.`,
+          systemPrompt: 'Anda adalah Showrunner & Kepala Penulis Skenario Serial Drama profesional Indonesia. Buat konsep serial drama yang emosional, kuat, logis, dan menarik dalam Bahasa Indonesia.',
+          userPrompt: `Buatkan konsep pengaturan cerita serial drama lengkap untuk genre: "${activeGenre}".
+Jumlah episode: ${proj.settings.episodeCount} episode (${proj.settings.episodeDuration}).
+Catatan awal pengguna (jika ada): "${currentIdea}".`,
           responseSchema: schema
         });
 
-        proj.settings.title = data.title;
-        proj.settings.theme = data.theme;
-        proj.settings.synopsis = data.synopsis;
-        proj.settings.settingPlace = data.settingPlace;
-        proj.settings.era = data.era;
-        proj.settings.mood = data.mood;
-        proj.settings.moralMessage = data.moralMessage;
-
+        proj.settings = {
+          ...proj.settings,
+          ...data
+        };
         saveState();
         renderApp();
-        showToast('Konsep & pengaturan cerita berhasil dirancang oleh AI!', 'success');
+        showToast('Konsep & pengaturan cerita berhasil dibuat oleh AI!', 'success');
       } catch (err) {
-        showToast('Gagal merancang konsep: ' + err.message, 'error');
+        showToast('Gagal membuat konsep cerita: ' + err.message, 'error');
       } finally {
         setLoading(false);
       }
     }
 
-    /**
-     * =========================================================================
-     * 8. RENDER HALAMAN D: PEMBUATAN KARAKTER (DENGAN KONSISTENSI VISUAL)
-     * =========================================================================
-     */
-    function renderCharactersView() {
-      const proj = getActiveProject();
-      const chars = proj.characters || [];
-
-      return `
-        <div class="space-y-6 animate-fade-in">
-          <!-- Header -->
-          <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
-            <div>
-              <span class="text-xs font-bold uppercase tracking-wider text-amber-500">Tahap 2 • Pemeran & Referensi Visual Konsisten</span>
-              <h1 class="font-serif font-bold text-2xl sm:text-3xl mt-1">Studio Pembuatan Karakter</h1>
-            </div>
-            <div class="flex flex-wrap items-center gap-2.5">
-              <button onclick="openCharacterFormModal()" class="px-4 py-2.5 rounded-xl bg-slate-200 dark:bg-studio-800 hover:bg-slate-300 dark:hover:bg-studio-700 font-semibold text-xs sm:text-sm flex items-center gap-2 transition-colors">
-                <i data-lucide="user-plus" class="w-4 h-4"></i>
-                <span>Tambah Manual</span>
-              </button>
-              <button onclick="aiGenerateCharacters()" class="px-5 py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-xs sm:text-sm shadow-lg shadow-amber-500/20 flex items-center gap-2">
-                <i data-lucide="sparkles" class="w-4 h-4"></i>
-                <span>Buat Karakter Otomatis (AI)</span>
-              </button>
-            </div>
-          </div>
-
-          <!-- Visual Consistency Banner -->
-          <div class="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-start gap-3">
-            <i data-lucide="shield-check" class="w-5 h-5 text-amber-500 shrink-0 mt-0.5"></i>
-            <div class="text-xs sm:text-sm text-slate-700 dark:text-slate-200 leading-relaxed">
-              <strong class="text-amber-600 dark:text-amber-300">Sistem Konsistensi Visual Karakter Aktif:</strong>
-              Setiap karakter memiliki <em>Ciri Fisik</em>, <em>Gaya Pakaian</em>, dan <em>Foto Referensi AI</em> yang terkunci. Saat Anda membuat ilustrasi adegan atau thumbnail di episode mana pun, AI akan otomatis menggunakan wajah, fitur fisik, dan pakaian karakter ini agar tetap konsisten dari episode pertama hingga terakhir.
-            </div>
-          </div>
-
-          <!-- Character Cards Grid -->
-          ${chars.length === 0 ? `
-            <div class="rounded-3xl bg-white dark:bg-studio-900 border border-dashed border-slate-300 dark:border-slate-700 p-10 text-center">
-              <div class="w-14 h-14 rounded-2xl bg-amber-500/15 text-amber-500 flex items-center justify-center mx-auto mb-4">
-                <i data-lucide="users" class="w-7 h-7"></i>
-              </div>
-              <h3 class="font-serif font-bold text-lg mb-2">Belum Ada Karakter dalam Serial Ini</h3>
-              <p class="text-sm text-slate-500 dark:text-slate-400 max-w-md mx-auto mb-5">
-                Klik tombol di bawah agar AI menciptakan jajaran tokoh lengkap sesuai genre dan sinopsis serial Anda.
-              </p>
-              <button onclick="aiGenerateCharacters()" class="px-6 py-3 rounded-2xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm inline-flex items-center gap-2">
-                <i data-lucide="sparkles" class="w-4 h-4"></i>
-                <span>Generate Karakter Otomatis</span>
-              </button>
-            </div>
-          ` : `
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-              ${chars.map(c => `
-                <div class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 overflow-hidden shadow-sm flex flex-col">
-                  <!-- Top Portrait & Basic Identity -->
-                  <div class="p-5 flex flex-col sm:flex-row gap-4 border-b border-slate-100 dark:border-slate-800">
-                    <div class="w-full sm:w-32 h-40 sm:h-36 rounded-2xl bg-gradient-to-br from-slate-800 to-studio-950 border border-amber-500/30 overflow-hidden relative shrink-0 group">
-                      ${c.imageUrl
-                        ? `<img src="${c.imageUrl}" alt="${escapeHtml(c.name)}" class="w-full h-full object-cover">`
-                        : `<div class="w-full h-full flex flex-col items-center justify-center p-2 text-center">
-                            <span class="font-serif font-bold text-3xl text-amber-400 mb-1">${escapeHtml(c.name.charAt(0))}</span>
-                            <span class="text-[10px] text-slate-400">Belum ada foto AI</span>
-                          </div>`
-                      }
-                      <button onclick="aiGenerateCharacterPortrait('${c.id}')"
-                        class="absolute inset-x-1.5 bottom-1.5 py-1.5 px-2 rounded-xl bg-slate-950/85 hover:bg-amber-500 text-white hover:text-slate-950 text-[10px] font-bold backdrop-blur-md flex items-center justify-center gap-1 transition-colors">
-                        <i data-lucide="camera" class="w-3 h-3"></i>
-                        <span>${c.imageUrl ? 'Buat Ulang Foto' : 'Foto Karakter AI'}</span>
-                      </button>
-                    </div>
-
-                    <div class="flex-1 min-w-0">
-                      <div class="flex items-start justify-between gap-2">
-                        <div>
-                          <span class="inline-block px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-amber-500/15 text-amber-600 dark:text-amber-300 mb-1">
-                            ${escapeHtml(c.role)}
-                          </span>
-                          <h3 class="font-serif font-bold text-xl text-slate-900 dark:text-white">${escapeHtml(c.name)}</h3>
-                          <p class="text-xs text-slate-500 dark:text-slate-400">${escapeHtml(c.age)} • ${escapeHtml(c.gender)}</p>
-                        </div>
-
-                        <div class="flex items-center gap-1">
-                          <button onclick="openCharacterFormModal('${c.id}')" title="Edit Karakter" class="p-2 rounded-xl bg-slate-100 dark:bg-studio-800 hover:text-amber-500 transition-colors">
-                            <i data-lucide="pencil" class="w-4 h-4"></i>
-                          </button>
-                          <button onclick="confirmDeleteCharacter('${c.id}')" title="Hapus Karakter" class="p-2 rounded-xl bg-slate-100 dark:bg-studio-800 hover:text-rose-500 transition-colors">
-                            <i data-lucide="trash-2" class="w-4 h-4"></i>
-                          </button>
-                        </div>
-                      </div>
-
-                      <div class="mt-3 text-xs text-slate-600 dark:text-slate-300 space-y-1">
-                        <div><strong class="text-slate-800 dark:text-slate-200">Sifat:</strong> ${escapeHtml(c.personality)}</div>
-                        <div><strong class="text-slate-800 dark:text-slate-200">Hubungan:</strong> ${escapeHtml(c.relationships)}</div>
-                      </div>
-                    </div>
-                  </div>
-
-                  <!-- Detailed Background & Visual Consistency Locks -->
-                  <div class="p-5 space-y-3 text-xs flex-1 bg-slate-50/50 dark:bg-studio-950/30">
-                    <div>
-                      <span class="font-bold uppercase tracking-wider text-[10px] text-slate-400 block mb-0.5">Latar Belakang Kehidupan</span>
-                      <p class="text-slate-700 dark:text-slate-300 leading-relaxed">${escapeHtml(c.background)}</p>
-                    </div>
-                    <div class="p-3 rounded-xl bg-white dark:bg-studio-850 border border-slate-200/80 dark:border-slate-800 space-y-2">
-                      <div class="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-amber-600 dark:text-amber-400">
-                        <i data-lucide="lock" class="w-3 h-3"></i>
-                        <span>Kunci Konsistensi Visual Semua Episode</span>
-                      </div>
-                      <p class="text-slate-700 dark:text-slate-300"><strong>Ciri Fisik:</strong> ${escapeHtml(c.physicalTraits)}</p>
-                      <p class="text-slate-700 dark:text-slate-300"><strong>Gaya Pakaian:</strong> ${escapeHtml(c.clothingStyle)}</p>
-                    </div>
-                  </div>
-                </div>
-              `).join('')}
-            </div>
-          `}
-
-          <div class="pt-4 flex justify-end">
-            <button onclick="navigateTo('plot')" class="px-6 py-3 rounded-2xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm flex items-center gap-2 transition-colors">
-              <span>Lanjut ke Generator Alur Cerita</span>
-              <i data-lucide="arrow-right" class="w-4 h-4"></i>
-            </button>
-          </div>
-        </div>
-      `;
-    }
-
     async function aiGenerateCharacters() {
       const proj = getActiveProject();
-      const s = proj.settings;
-      const genre = proj.customGenre || proj.genre;
+      const activeGenre = proj.customGenre.trim() || proj.genre;
 
-      setLoading(true, 'Menciptakan Jajaran Pemeran Drama...', 'AI sedang merancang karakter utama & pendukung dengan latar belakang serta ciri visual konsisten.');
+      setLoading(true, 'Menciptakan Karakter Serial...', 'AI sedang merancang profil tokoh beserta ciri fisik & gaya pakaian yang konsisten.');
       try {
         const schema = {
-          type: "ARRAY",
-          items: {
-            type: "OBJECT",
-            properties: {
-              name: { type: "STRING" },
-              age: { type: "STRING" },
-              gender: { type: "STRING" },
-              role: { type: "STRING" },
-              personality: { type: "STRING" },
-              background: { type: "STRING" },
-              relationships: { type: "STRING" },
-              physicalTraits: { type: "STRING" },
-              clothingStyle: { type: "STRING" }
-            },
-            required: ["name", "age", "gender", "role", "personality", "background", "relationships", "physicalTraits", "clothingStyle"]
-          }
+          type: "OBJECT",
+          properties: {
+            characters: {
+              type: "ARRAY",
+              items: {
+                type: "OBJECT",
+                properties: {
+                  name: { type: "STRING" },
+                  age: { type: "STRING" },
+                  gender: { type: "STRING" },
+                  role: { type: "STRING" },
+                  personality: { type: "STRING" },
+                  background: { type: "STRING" },
+                  relationships: { type: "STRING" },
+                  physicalTraits: { type: "STRING" },
+                  clothingStyle: { type: "STRING" }
+                },
+                required: ["name", "age", "gender", "role", "personality", "background", "relationships", "physicalTraits", "clothingStyle"]
+              }
+            }
+          },
+          required: ["characters"]
         };
 
-        const generated = await callGeminiText({
-          systemPrompt: 'Kamu adalah Casting Director dan Penulis Karakter serial drama Indonesia. Buat 4 karakter utama dan pendukung yang memiliki dinamika konflik kuat, manusiawi, serta deskripsi fisik dan pakaian yang sangat spesifik agar mudah digambar secara konsisten di semua episode.',
-          userPrompt: `Buatkan 4 karakter untuk serial drama berjudul "${s.title}" dengan genre "${genre}". Sinopsis: "${s.synopsis}". Latar tempat: "${s.settingPlace}", Zaman: "${s.era}".`,
+        const data = await callGeminiText({
+          systemPrompt: 'Anda adalah Casting Director & Perancang Karakter Serial Drama Indonesia. Buat 4 hingga 5 karakter utama dan pendukung yang saling terhubung secara dramatis. Berikan deskripsi ciri fisik dan gaya pakaian yang spesifik agar konsisten di semua episode.',
+          userPrompt: `Judul Serial: "${proj.settings.title}"
+Genre: "${activeGenre}"
+Tema: "${proj.settings.theme}"
+Sinopsis: "${proj.settings.synopsis}"
+Latar Tempat & Zaman: "${proj.settings.settingPlace}" (${proj.settings.era})`,
           responseSchema: schema
         });
 
-        proj.characters = generated.map((c, idx) => ({
+        const existingImages = {};
+        (proj.characters || []).forEach(c => {
+          if (c.imageUrl) existingImages[c.name.toLowerCase()] = c.imageUrl;
+        });
+
+        proj.characters = (data.characters || []).map((c, idx) => ({
           id: 'char_' + Date.now() + '_' + idx,
           ...c,
-          imageUrl: ''
+          imageUrl: existingImages[c.name.toLowerCase()] || ''
         }));
 
         saveState();
         renderApp();
-        showToast(`${proj.characters.length} karakter berhasil dibuat oleh AI!`, 'success');
+        showToast(`${proj.characters.length} karakter berhasil dibuat!`, 'success');
       } catch (err) {
         showToast('Gagal membuat karakter: ' + err.message, 'error');
       } finally {
@@ -1794,31 +1081,33 @@
       }
     }
 
-    async function aiGenerateCharacterPortrait(charId) {
+    async function aiGenerateSingleCharacterPortrait(charId) {
       const proj = getActiveProject();
-      const char = proj.characters.find(c => c.id === charId);
+      const char = (proj.characters || []).find(c => c.id === charId);
       if (!char) return;
 
-      setLoading(true, `Membuat Foto Referensi: ${char.name}...`, 'AI sedang menghasilkan potret karakter resmi sebagai acuan visual di seluruh episode.');
-      try {
-        const prompt = `Character reference portrait photography for an Indonesian drama series titled "${proj.settings.title}" (${proj.settings.era}, ${proj.settings.settingPlace}).
-Character Name: ${char.name}, ${char.age}, ${char.gender}.
-Physical Features: ${char.physicalTraits}.
-Signature Outfit: ${char.clothingStyle}.
-Expression & Personality: ${char.personality}.
-Style: Photorealistic 35mm cinema character portrait, chest-up medium close-up, dramatic studio & natural lighting, clear facial features, neutral atmospheric background, high detail.`;
+      const prompt = `Close-up cinematic character portrait for Indonesian drama series "${proj.settings.title}".
+Character: ${char.name}, ${char.age}, ${char.gender}, role: ${char.role}.
+Physical appearance (MUST BE EXACT): ${char.physicalTraits}.
+Signature clothing: ${char.clothingStyle}.
+Setting background hint: ${proj.settings.settingPlace} (${proj.settings.era}).
+Style: ${VISUAL_STYLES[0].prompt}.`;
 
+      setLoading(true, `Membuat Foto Referensi ${char.name}...`, 'Foto ini akan menjadi acuan konsistensi wajah & pakaian di semua episode.');
+      try {
         const imageUrl = await callGeminiImage({
           prompt,
+          referenceImages: char.imageUrl ? [char.imageUrl] : [],
           aspectRatio: '3:4',
           useAdvanced: true
         });
 
         char.imageUrl = imageUrl;
+        proj.gallery = (proj.gallery || []).filter(g => !g.isPlaceholderArt);
         proj.gallery.unshift({
           id: 'img_' + Date.now(),
           category: 'Foto setiap karakter',
-          title: `Potret Referensi: ${char.name}`,
+          title: `Referensi Karakter: ${char.name}`,
           styleName: 'Realistis seperti film layar lebar',
           prompt,
           imageUrl,
@@ -1827,7 +1116,7 @@ Style: Photorealistic 35mm cinema character portrait, chest-up medium close-up, 
 
         saveState();
         renderApp();
-        showToast(`Foto referensi ${char.name} berhasil dibuat & dikunci!`, 'success');
+        showToast(`Foto referensi ${char.name} berhasil dibuat!`, 'success');
       } catch (err) {
         showToast('Gagal membuat foto karakter: ' + err.message, 'error');
       } finally {
@@ -1835,279 +1124,15 @@ Style: Photorealistic 35mm cinema character portrait, chest-up medium close-up, 
       }
     }
 
-    function openCharacterFormModal(charId = null) {
-      const proj = getActiveProject();
-      const existing = charId ? proj.characters.find(c => c.id === charId) : null;
-      const c = existing || {
-        name: '', age: '', gender: 'Perempuan', role: 'Karakter Pendukung',
-        personality: '', background: '', relationships: '', physicalTraits: '', clothingStyle: ''
-      };
-
-      openModal(`
-        <div class="flex items-center justify-between mb-4">
-          <h3 class="font-serif font-bold text-xl">${existing ? 'Edit Karakter' : 'Tambah Karakter Baru'}</h3>
-          <button onclick="closeModal()" class="p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-studio-800 text-slate-400">
-            <i data-lucide="x" class="w-5 h-5"></i>
-          </button>
-        </div>
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3.5 text-sm max-h-[70vh] overflow-y-auto pr-1">
-          <div>
-            <label class="block text-xs font-semibold text-slate-500 mb-1">Nama Karakter *</label>
-            <input id="cf-name" type="text" value="${escapeHtml(c.name)}" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700" />
-          </div>
-          <div>
-            <label class="block text-xs font-semibold text-slate-500 mb-1">Peran dalam Cerita</label>
-            <input id="cf-role" type="text" value="${escapeHtml(c.role)}" placeholder="Protagonis, Antagonis, Mentor..." class="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700" />
-          </div>
-          <div>
-            <label class="block text-xs font-semibold text-slate-500 mb-1">Usia</label>
-            <input id="cf-age" type="text" value="${escapeHtml(c.age)}" placeholder="Contoh: 28 Tahun" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700" />
-          </div>
-          <div>
-            <label class="block text-xs font-semibold text-slate-500 mb-1">Jenis Kelamin</label>
-            <select id="cf-gender" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700">
-              <option value="Laki-laki" ${c.gender === 'Laki-laki' ? 'selected' : ''}>Laki-laki</option>
-              <option value="Perempuan" ${c.gender === 'Perempuan' ? 'selected' : ''}>Perempuan</option>
-            </select>
-          </div>
-          <div class="sm:col-span-2">
-            <label class="block text-xs font-semibold text-slate-500 mb-1">Sifat dan Kepribadian</label>
-            <input id="cf-personality" type="text" value="${escapeHtml(c.personality)}" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700" />
-          </div>
-          <div class="sm:col-span-2">
-            <label class="block text-xs font-semibold text-slate-500 mb-1">Latar Belakang Kehidupan</label>
-            <textarea id="cf-background" rows="2" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700">${escapeHtml(c.background)}</textarea>
-          </div>
-          <div class="sm:col-span-2">
-            <label class="block text-xs font-semibold text-slate-500 mb-1">Hubungan dengan Karakter Lain</label>
-            <input id="cf-relationships" type="text" value="${escapeHtml(c.relationships)}" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700" />
-          </div>
-          <div class="sm:col-span-2">
-            <label class="block text-xs font-semibold text-amber-500 mb-1">Ciri Fisik (Acuan Konsistensi Wajah)</label>
-            <input id="cf-physical" type="text" value="${escapeHtml(c.physicalTraits)}" placeholder="Wajah oval, kulit sawo matang, rambut ikal sebahu, tatapan lembut..." class="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-amber-500/40" />
-          </div>
-          <div class="sm:col-span-2">
-            <label class="block text-xs font-semibold text-amber-500 mb-1">Gaya Pakaian (Acuan Konsistensi Kostum)</label>
-            <input id="cf-clothing" type="text" value="${escapeHtml(c.clothingStyle)}" placeholder="Kebaya kutubaru modern warna biru laut, selendang batik..." class="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-amber-500/40" />
-          </div>
-        </div>
-        <div class="flex justify-end gap-2 mt-5 pt-4 border-t border-slate-200 dark:border-slate-800">
-          <button onclick="closeModal()" class="px-4 py-2.5 rounded-xl bg-slate-200 dark:bg-studio-800 text-sm font-semibold">Batal</button>
-          <button onclick="saveCharacterForm('${charId || ''}')" class="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-sm font-bold">Simpan Karakter</button>
-        </div>
-      `);
-    }
-
-    function saveCharacterForm(charId) {
-      const name = document.getElementById('cf-name').value.trim();
-      if (!name) {
-        showToast('Nama karakter wajib diisi.', 'warning');
-        return;
-      }
-      const proj = getActiveProject();
-      const updatedData = {
-        name,
-        role: document.getElementById('cf-role').value.trim() || 'Karakter Pendukung',
-        age: document.getElementById('cf-age').value.trim() || 'Dewasa',
-        gender: document.getElementById('cf-gender').value,
-        personality: document.getElementById('cf-personality').value.trim(),
-        background: document.getElementById('cf-background').value.trim(),
-        relationships: document.getElementById('cf-relationships').value.trim(),
-        physicalTraits: document.getElementById('cf-physical').value.trim(),
-        clothingStyle: document.getElementById('cf-clothing').value.trim()
-      };
-
-      if (charId) {
-        const idx = proj.characters.findIndex(c => c.id === charId);
-        if (idx !== -1) {
-          proj.characters[idx] = { ...proj.characters[idx], ...updatedData };
-        }
-      } else {
-        proj.characters.push({
-          id: 'char_' + Date.now(),
-          ...updatedData,
-          imageUrl: ''
-        });
-      }
-
-      closeModal();
-      saveState();
-      renderApp();
-      showToast('Data karakter berhasil disimpan!', 'success');
-    }
-
-    function confirmDeleteCharacter(charId) {
-      const proj = getActiveProject();
-      const char = proj.characters.find(c => c.id === charId);
-      if (!char) return;
-      openModal(`
-        <h3 class="font-serif font-bold text-lg mb-2">Hapus Karakter "${escapeHtml(char.name)}"?</h3>
-        <p class="text-sm text-slate-500 dark:text-slate-400 mb-5">Karakter akan dihapus dari daftar pemeran proyek ini.</p>
-        <div class="flex justify-end gap-2">
-          <button onclick="closeModal()" class="px-4 py-2 rounded-xl bg-slate-200 dark:bg-studio-800 text-sm font-semibold">Batal</button>
-          <button onclick="deleteCharacter('${charId}')" class="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-sm font-bold">Ya, Hapus</button>
-        </div>
-      `);
-    }
-
-    function deleteCharacter(charId) {
-      const proj = getActiveProject();
-      proj.characters = proj.characters.filter(c => c.id !== charId);
-      closeModal();
-      saveState();
-      renderApp();
-      showToast('Karakter dihapus.', 'info');
-    }
-
-    /**
-     * =========================================================================
-     * 9. RENDER HALAMAN E: GENERATOR ALUR CERITA BERSERI
-     * =========================================================================
-     */
-    function renderPlotView() {
-      const proj = getActiveProject();
-      const arc = proj.storyArc;
-
-      return `
-        <div class="space-y-6 animate-fade-in">
-          <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
-            <div>
-              <span class="text-xs font-bold uppercase tracking-wider text-amber-500">Tahap 3 • Struktur Dramatik & Kontinuitas</span>
-              <h1 class="font-serif font-bold text-2xl sm:text-3xl mt-1">Generator Alur Cerita Berseri</h1>
-            </div>
-            <button onclick="aiGenerateStoryArc()" class="px-5 py-3 rounded-2xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-xs sm:text-sm shadow-lg shadow-amber-500/20 flex items-center justify-center gap-2">
-              <i data-lucide="sparkles" class="w-4 h-4"></i>
-              <span>${arc ? 'Buat Ulang Seluruh Alur Serial' : 'Buat Alur Cerita & Outline Episode (AI)'}</span>
-            </button>
-          </div>
-
-          ${!arc ? `
-            <div class="rounded-3xl bg-white dark:bg-studio-900 border border-dashed border-slate-300 dark:border-slate-700 p-10 text-center">
-              <div class="w-14 h-14 rounded-2xl bg-amber-500/15 text-amber-500 flex items-center justify-center mx-auto mb-4">
-                <i data-lucide="git-branch" class="w-7 h-7"></i>
-              </div>
-              <h3 class="font-serif font-bold text-lg mb-2">Alur Serial Belum Dirancang</h3>
-              <p class="text-sm text-slate-500 dark:text-slate-400 max-w-lg mx-auto mb-5">
-                AI akan menyusun konflik utama, konflik tambahan, klimaks, plot twist, penyelesaian cerita, hubungan antar tokoh, serta alur Episode 1 sampai ${proj.settings.episodeCount} yang saling terhubung erat.
-              </p>
-              <button onclick="aiGenerateStoryArc()" class="px-6 py-3 rounded-2xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm inline-flex items-center gap-2">
-                <i data-lucide="sparkles" class="w-4 h-4"></i>
-                <span>Rancang Alur Cerita Sekarang</span>
-              </button>
-            </div>
-          ` : `
-            <!-- Series Master Blueprint -->
-            <div class="grid grid-cols-1 lg:grid-cols-3 gap-5">
-              <div class="lg:col-span-2 rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-6 space-y-5">
-                <div>
-                  <span class="text-[11px] font-bold uppercase tracking-wider text-amber-500">Ide Cerita & Premis Inti</span>
-                  <p class="font-serif font-bold text-lg sm:text-xl text-slate-900 dark:text-white mt-1 leading-snug">"${escapeHtml(arc.storyIdea)}"</p>
-                </div>
-
-                <div>
-                  <span class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Sinopsis Lengkap Serial</span>
-                  <p class="text-sm text-slate-700 dark:text-slate-300 mt-1 leading-relaxed">${escapeHtml(arc.fullSynopsis)}</p>
-                </div>
-
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
-                  <div class="p-4 rounded-2xl bg-rose-500/10 border border-rose-500/25">
-                    <div class="text-xs font-bold text-rose-600 dark:text-rose-400 uppercase tracking-wider mb-1">Konflik Utama</div>
-                    <p class="text-xs sm:text-sm text-slate-700 dark:text-slate-200 leading-relaxed">${escapeHtml(arc.mainConflict)}</p>
-                  </div>
-                  <div class="p-4 rounded-2xl bg-indigo-500/10 border border-indigo-500/25">
-                    <div class="text-xs font-bold text-indigo-600 dark:text-indigo-400 uppercase tracking-wider mb-1">Konflik Tambahan (Subplot)</div>
-                    <p class="text-xs sm:text-sm text-slate-700 dark:text-slate-200 leading-relaxed">${escapeHtml(arc.subConflicts)}</p>
-                  </div>
-                </div>
-              </div>
-
-              <!-- Climax, Twist, Resolution & Dynamics -->
-              <div class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-6 space-y-4">
-                <div>
-                  <span class="text-[11px] font-bold uppercase tracking-wider text-amber-500 flex items-center gap-1.5">
-                    <i data-lucide="zap" class="w-3.5 h-3.5"></i> Klimaks Serial
-                  </span>
-                  <p class="text-xs sm:text-sm text-slate-700 dark:text-slate-300 mt-1 leading-relaxed">${escapeHtml(arc.climax)}</p>
-                </div>
-
-                <div class="p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/30">
-                  <span class="text-[11px] font-bold uppercase tracking-wider text-amber-600 dark:text-amber-300 flex items-center gap-1.5">
-                    <i data-lucide="shuffle" class="w-3.5 h-3.5"></i> Plot Twist Besar
-                  </span>
-                  <p class="text-xs sm:text-sm text-slate-800 dark:text-slate-200 mt-1 leading-relaxed">${escapeHtml(arc.plotTwist)}</p>
-                </div>
-
-                <div>
-                  <span class="text-[11px] font-bold uppercase tracking-wider text-emerald-500 flex items-center gap-1.5">
-                    <i data-lucide="check-circle" class="w-3.5 h-3.5"></i> Penyelesaian Cerita
-                  </span>
-                  <p class="text-xs sm:text-sm text-slate-700 dark:text-slate-300 mt-1 leading-relaxed">${escapeHtml(arc.resolution)}</p>
-                </div>
-
-                <div class="pt-3 border-t border-slate-100 dark:border-slate-800">
-                  <span class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Dinamika Hubungan Antar Tokoh</span>
-                  <p class="text-xs text-slate-600 dark:text-slate-300 mt-1 leading-relaxed">${escapeHtml(arc.characterDynamics)}</p>
-                </div>
-              </div>
-            </div>
-
-            <!-- Serialized Episode-by-Episode Timeline -->
-            <section class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-6">
-              <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-6">
-                <div>
-                  <h2 class="font-serif font-bold text-xl">Alur Cerita Setiap Episode (Saling Terhubung)</h2>
-                  <p class="text-xs text-slate-500 dark:text-slate-400">Setiap episode dirancang sebagai mata rantai berkelanjutan menuju klimaks dan penyelesaian serial.</p>
-                </div>
-              </div>
-
-              <div class="space-y-4">
-                ${(arc.episodes || []).map(ep => {
-                  const hasScript = Boolean(proj.scripts?.[ep.episodeNumber]);
-                  return `
-                    <div class="p-5 rounded-2xl bg-slate-50 dark:bg-studio-850 border border-slate-200/80 dark:border-slate-800 hover:border-amber-500/40 transition-all">
-                      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-2">
-                        <div class="flex items-center gap-3">
-                          <span class="px-3 py-1 rounded-xl bg-amber-500 text-slate-950 font-bold text-xs">
-                            EPISODE ${ep.episodeNumber}
-                          </span>
-                          <h3 class="font-serif font-bold text-lg text-slate-900 dark:text-white">${escapeHtml(ep.title)}</h3>
-                        </div>
-                        <button onclick="appState.selectedEpisodeNumber=${ep.episodeNumber}; navigateTo('script');"
-                          class="px-4 py-2 rounded-xl ${hasScript ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-300 border border-emerald-500/30' : 'bg-amber-500/15 text-amber-600 dark:text-amber-300 border border-amber-500/30'} hover:bg-amber-500 hover:text-slate-950 font-semibold text-xs flex items-center gap-1.5 transition-colors self-start sm:self-auto">
-                          <i data-lucide="file-text" class="w-3.5 h-3.5"></i>
-                          <span>${hasScript ? 'Buka Naskah Episode' : 'Tulis Naskah Episode'}</span>
-                        </button>
-                      </div>
-
-                      <p class="text-sm text-slate-700 dark:text-slate-300 leading-relaxed mb-3">${escapeHtml(ep.summary)}</p>
-
-                      <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
-                        <div class="p-3 rounded-xl bg-white dark:bg-studio-900 border border-slate-200/70 dark:border-slate-800">
-                          <span class="font-bold text-sky-600 dark:text-sky-400">Benang Merah Cerita Utama:</span>
-                          <span class="text-slate-600 dark:text-slate-300"> ${escapeHtml(ep.connectionToMainArc)}</span>
-                        </div>
-                        <div class="p-3 rounded-xl bg-white dark:bg-studio-900 border border-slate-200/70 dark:border-slate-800">
-                          <span class="font-bold text-amber-600 dark:text-amber-400">Cliffhanger Penutup:</span>
-                          <span class="text-slate-600 dark:text-slate-300"> ${escapeHtml(ep.cliffhanger)}</span>
-                        </div>
-                      </div>
-                    </div>
-                  `;
-                }).join('')}
-              </div>
-            </section>
-          `}
-        </div>
-      `;
-    }
-
     async function aiGenerateStoryArc() {
       const proj = getActiveProject();
-      const s = proj.settings;
-      const genre = proj.customGenre || proj.genre;
-      const charSummary = (proj.characters || []).map(c => `${c.name} (${c.role}: ${c.personality})`).join('; ');
+      const activeGenre = proj.customGenre.trim() || proj.genre;
+      const epCount = Math.max(1, Math.min(30, parseInt(proj.settings.episodeCount, 10) || 5));
+      const charSummary = (proj.characters || [])
+        .map(c => `- ${c.name} (${c.role}, ${c.age}): ${c.personality}. Hubungan: ${c.relationships}`)
+        .join('\n');
 
-      setLoading(true, 'Menyusun Alur Cerita Berseri...', `AI sedang merangkai ${s.episodeCount} episode yang saling terhubung dengan konflik utama, klimaks, dan plot twist.`);
+      setLoading(true, `Menyusun Alur Serial (${epCount} Episode)...`, 'AI memastikan setiap episode saling terhubung dari awal hingga akhir.');
       try {
         const schema = {
           type: "OBJECT",
@@ -2138,381 +1163,32 @@ Style: Photorealistic 35mm cinema character portrait, chest-up medium close-up, 
           required: ["storyIdea", "fullSynopsis", "mainConflict", "subConflicts", "climax", "plotTwist", "resolution", "characterDynamics", "episodes"]
         };
 
-        const arcData = await callGeminiText({
-          systemPrompt: 'Kamu adalah Kepala Penulis Skenario Serial Drama (Showrunner). Buat alur cerita serial drama yang sangat terstruktur dan saling bersambung dari episode 1 hingga episode terakhir. JANGAN membuat episode berdiri sendiri tanpa kaitan dengan cerita utama.',
-          userPrompt: `Buatkan alur cerita lengkap untuk serial drama "${s.title}" (Genre: ${genre}).
-Tema: ${s.theme}. Sinopsis awal: ${s.synopsis}. Latar: ${s.settingPlace} (${s.era}). Suasana: ${s.mood}. Gaya penceritaan: ${s.narrativeStyle}. Pesan moral: ${s.moralMessage}.
-Karakter yang terlibat: ${charSummary || 'Buat karakter pendukung yang relevan'}.
-Jumlah episode yang wajib dibuat: tepat ${s.episodeCount} episode (nomor 1 sampai ${s.episodeCount}).`,
+        const data = await callGeminiText({
+          systemPrompt: 'Anda adalah Kepala Penulis Serial Drama televisi & OTT. Rancang alur cerita serial bersambung yang utuh. PENTING: Semua episode harus saling terhubung dari Episode 1 sampai Episode terakhir. Jangan membuat episode yang berdiri sendiri tanpa kaitan dengan konflik utama.',
+          userPrompt: `Judul: "${proj.settings.title}"
+Genre: "${activeGenre}"
+Tema: "${proj.settings.theme}"
+Sinopsis Awal: "${proj.settings.synopsis}"
+Latar: "${proj.settings.settingPlace}" (${proj.settings.era}), Suasana: "${proj.settings.mood}"
+Pesan Moral: "${proj.settings.moralMessage}"
+Jumlah Episode WAJIB: TEPAT ${epCount} episode.
+Daftar Tokoh:
+${charSummary || 'Belum ada daftar tokoh khusus, silakan sesuaikan dengan cerita.'}`,
           responseSchema: schema
         });
 
-        proj.storyArc = arcData;
+        proj.storyArc = data;
         saveState();
         renderApp();
-        showToast('Alur cerita berseri berhasil dirancang!', 'success');
+        showToast(`Alur cerita berseri ${data.episodes.length} episode berhasil disusun!`, 'success');
       } catch (err) {
-        showToast('Gagal membuat alur cerita: ' + err.message, 'error');
+        showToast('Gagal menyusun alur cerita: ' + err.message, 'error');
       } finally {
         setLoading(false);
       }
     }
 
-    /**
-     * =========================================================================
-     * 10. RENDER HALAMAN F: GENERATOR NASKAH EPISODE
-     * =========================================================================
-     */
-    function renderScriptView() {
-      const proj = getActiveProject();
-      const totalEps = Number(proj.settings.episodeCount) || 5;
-      const epNum = Math.min(Math.max(1, appState.selectedEpisodeNumber || 1), totalEps);
-      appState.selectedEpisodeNumber = epNum;
-
-      const script = proj.scripts?.[epNum];
-      const outline = proj.storyArc?.episodes?.find(e => Number(e.episodeNumber) === epNum);
-
-      return `
-        <div class="space-y-6 animate-fade-in">
-          <!-- Header & Episode Selector -->
-          <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-            <div>
-              <span class="text-xs font-bold uppercase tracking-wider text-amber-500">Tahap 4 • Ruang Penulisan Skenario</span>
-              <h1 class="font-serif font-bold text-2xl sm:text-3xl mt-1">Generator Naskah Episode</h1>
-            </div>
-
-            <!-- Episode Pills -->
-            <div class="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-1">
-              ${Array.from({ length: totalEps }, (_, i) => i + 1).map(num => {
-                const isSelected = num === epNum;
-                const isWritten = Boolean(proj.scripts?.[num]);
-                return `
-                  <button onclick="appState.selectedEpisodeNumber=${num}; appState.isEditingScript=false; renderApp();"
-                    class="px-3.5 py-2 rounded-xl text-xs font-bold whitespace-nowrap flex items-center gap-1.5 border transition-all ${
-                      isSelected
-                        ? 'bg-amber-500 text-slate-950 border-amber-500 shadow-md shadow-amber-500/20'
-                        : isWritten
-                          ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-300 border-emerald-500/30 hover:border-amber-500'
-                          : 'bg-white dark:bg-studio-900 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-800 hover:border-amber-500'
-                    }">
-                    <span>Ep ${num}</span>
-                    ${isWritten ? `<span class="w-1.5 h-1.5 rounded-full ${isSelected ? 'bg-slate-950' : 'bg-emerald-400'}"></span>` : ''}
-                  </button>
-                `;
-              }).join('')}
-            </div>
-          </div>
-
-          <!-- Outline Context Banner if Available -->
-          ${outline ? `
-            <div class="p-4 rounded-2xl bg-slate-100/80 dark:bg-studio-900 border border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div class="text-xs sm:text-sm">
-                <span class="font-bold text-amber-600 dark:text-amber-400">Panduan Alur Episode ${epNum} (${escapeHtml(outline.title)}):</span>
-                <span class="text-slate-600 dark:text-slate-300"> ${escapeHtml(outline.summary)}</span>
-              </div>
-            </div>
-          ` : ''}
-
-          <!-- ACTION BUTTONS BAR -->
-          <div class="p-4 rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 flex flex-wrap items-center gap-2.5">
-            <button onclick="aiGenerateEpisodeScript(${epNum})"
-              class="px-4 py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-xs sm:text-sm shadow-md shadow-amber-500/20 flex items-center gap-2">
-              <i data-lucide="sparkles" class="w-4 h-4"></i>
-              <span>Buat Episode</span>
-            </button>
-
-            <button onclick="aiRefineEpisodeScript(${epNum}, 'dialogue')" ${!script ? 'disabled' : ''}
-              class="px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 hover:bg-amber-500/15 disabled:opacity-40 text-xs sm:text-sm font-semibold flex items-center gap-1.5 transition-colors">
-              <i data-lucide="message-square-quote" class="w-4 h-4 text-amber-500"></i>
-              <span>Buat Ulang Dialog</span>
-            </button>
-
-            <button onclick="aiRefineEpisodeScript(${epNum}, 'extend')" ${!script ? 'disabled' : ''}
-              class="px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 hover:bg-amber-500/15 disabled:opacity-40 text-xs sm:text-sm font-semibold flex items-center gap-1.5 transition-colors">
-              <i data-lucide="plus-circle" class="w-4 h-4 text-sky-500"></i>
-              <span>Perpanjang Cerita</span>
-            </button>
-
-            <button onclick="openChangeConflictModal(${epNum})" ${!script ? 'disabled' : ''}
-              class="px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 hover:bg-amber-500/15 disabled:opacity-40 text-xs sm:text-sm font-semibold flex items-center gap-1.5 transition-colors">
-              <i data-lucide="flame" class="w-4 h-4 text-rose-500"></i>
-              <span>Ubah Konflik</span>
-            </button>
-
-            <button onclick="toggleEditScriptMode()" ${!script ? 'disabled' : ''}
-              class="px-3.5 py-2.5 rounded-xl ${appState.isEditingScript ? 'bg-emerald-500 text-slate-950 font-bold' : 'bg-slate-100 dark:bg-studio-800 hover:bg-amber-500/15 font-semibold'} disabled:opacity-40 text-xs sm:text-sm flex items-center gap-1.5 transition-colors">
-              <i data-lucide="${appState.isEditingScript ? 'check' : 'edit-3'}" class="w-4 h-4"></i>
-              <span>${appState.isEditingScript ? 'Selesai Edit' : 'Edit Naskah'}</span>
-            </button>
-
-            ${epNum < totalEps ? `
-              <button onclick="continueToNextEpisode(${epNum})"
-                class="ml-auto px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs sm:text-sm flex items-center gap-1.5 transition-colors">
-                <span>Lanjutkan ke Episode Berikutnya</span>
-                <i data-lucide="arrow-right" class="w-4 h-4"></i>
-              </button>
-            ` : ''}
-          </div>
-
-          <!-- SCRIPT DISPLAY OR EMPTY STATE -->
-          ${!script ? `
-            <div class="rounded-3xl bg-white dark:bg-studio-900 border border-dashed border-slate-300 dark:border-slate-700 p-10 text-center">
-              <div class="w-14 h-14 rounded-2xl bg-amber-500/15 text-amber-500 flex items-center justify-center mx-auto mb-4">
-                <i data-lucide="file-text" class="w-7 h-7"></i>
-              </div>
-              <h3 class="font-serif font-bold text-xl mb-2">Naskah Episode ${epNum} Belum Dibuat</h3>
-              <p class="text-sm text-slate-500 dark:text-slate-400 max-w-lg mx-auto mb-6">
-                Klik tombol <strong>Buat Episode</strong> agar AI menyusun naskah lengkap meliputi adegan pembuka yang memikat, pembagian adegan, deskripsi lokasi, dialog beremosi, arahan gerakan kamera, musik pendukung, dan cliffhanger penutup.
-              </p>
-              <button onclick="aiGenerateEpisodeScript(${epNum})" class="px-6 py-3.5 rounded-2xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm inline-flex items-center gap-2 shadow-lg shadow-amber-500/20">
-                <i data-lucide="sparkles" class="w-4 h-4"></i>
-                <span>Buat Episode ${epNum} Sekarang</span>
-              </button>
-            </div>
-          ` : appState.isEditingScript ? renderScriptEditor(script, epNum) : renderScriptReader(script, epNum)}
-        </div>
-      `;
-    }
-
-    function renderScriptReader(script, epNum) {
-      const activeAudio = appState.audioPlayer && appState.audioPlayer.epNum === epNum ? appState.audioPlayer : null;
-      return `
-        <div class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 overflow-hidden shadow-sm">
-          <!-- Screenplay Cover Header -->
-          <div class="p-6 sm:p-8 bg-gradient-to-r from-studio-900 via-studio-850 to-slate-900 text-white border-b border-slate-800">
-            <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
-              <span class="px-3 py-1 rounded-full bg-amber-500/20 border border-amber-400/30 text-amber-300 text-xs font-bold tracking-wider">
-                EPISODE ${script.episodeNumber}
-              </span>
-              <div class="flex flex-wrap items-center gap-2">
-                <select onchange="appState.selectedVoice = this.value" title="Pilih Karakter Suara AI"
-                  class="px-2.5 py-1.5 rounded-xl bg-white/10 border border-white/15 text-xs text-white focus:outline-none">
-                  <option value="Kore" class="text-slate-900" ${appState.selectedVoice === 'Kore' ? 'selected' : ''}>Suara: Kore (Dramatis)</option>
-                  <option value="Aoede" class="text-slate-900" ${appState.selectedVoice === 'Aoede' ? 'selected' : ''}>Suara: Aoede (Lembut)</option>
-                  <option value="Puck" class="text-slate-900" ${appState.selectedVoice === 'Puck' ? 'selected' : ''}>Suara: Puck (Ekspresif)</option>
-                  <option value="Charon" class="text-slate-900" ${appState.selectedVoice === 'Charon' ? 'selected' : ''}>Suara: Charon (Berwibawa)</option>
-                </select>
-                <button onclick="playEpisodeAudioPreview(${epNum})" class="px-3.5 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold flex items-center gap-1.5 transition-colors">
-                  <i data-lucide="volume-2" class="w-3.5 h-3.5"></i>
-                  <span>Dengarkan Pembacaan AI</span>
-                </button>
-                <button onclick="copyEpisodeScriptText(${epNum})" class="px-3.5 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 text-xs font-semibold flex items-center gap-1.5 transition-colors">
-                  <i data-lucide="copy" class="w-3.5 h-3.5 text-amber-400"></i>
-                  <span>Salin Naskah</span>
-                </button>
-              </div>
-            </div>
-
-            ${activeAudio ? `
-              <div class="mb-4 p-3.5 rounded-2xl bg-slate-950/80 border border-amber-400/40 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <div class="flex items-center gap-2.5 text-xs">
-                  <span class="w-2.5 h-2.5 rounded-full bg-amber-400 animate-ping"></span>
-                  <div>
-                    <div class="font-bold text-amber-300">Pemutar Suara Naskah Episode ${epNum}</div>
-                    <div class="text-slate-400 text-[11px]">${activeAudio.isFallback ? 'Mode Sulih Suara Browser (Bahasa Indonesia)' : 'Audio HD Gemini TTS (' + escapeHtml(activeAudio.voiceName) + ')'}</div>
-                  </div>
-                </div>
-                <div class="flex items-center gap-2 flex-1 sm:justify-end">
-                  ${activeAudio.audioUrl ? `
-                    <audio id="episode-tts-audio" controls autoplay src="${activeAudio.audioUrl}" class="h-9 max-w-full sm:w-72 rounded-lg"></audio>
-                    <a href="${activeAudio.audioUrl}" download="Audio_Episode_${epNum}.wav" title="Unduh Audio WAV" class="p-2 rounded-xl bg-white/10 hover:bg-amber-500 hover:text-slate-950 transition-colors">
-                      <i data-lucide="download" class="w-4 h-4"></i>
-                    </a>
-                  ` : `
-                    <button onclick="playBrowserSpeechFallback(${epNum})" class="px-3 py-1.5 rounded-xl bg-amber-500 text-slate-950 font-bold text-xs">Putar Ulang</button>
-                  `}
-                  <button onclick="stopEpisodeAudio()" title="Tutup Pemutar" class="p-2 rounded-xl bg-white/10 hover:bg-rose-500/80 transition-colors">
-                    <i data-lucide="x" class="w-4 h-4"></i>
-                  </button>
-                </div>
-              </div>
-            ` : ''}
-
-            <h2 class="font-serif font-bold text-2xl sm:text-3xl mb-3">${escapeHtml(script.title)}</h2>
-            <p class="text-sm text-slate-300 leading-relaxed mb-5">${escapeHtml(script.summary)}</p>
-
-            <!-- Adegan Pembuka yang Menarik -->
-            <div class="p-4 rounded-2xl bg-amber-500/10 border border-amber-400/30">
-              <div class="text-[11px] font-bold uppercase tracking-wider text-amber-300 mb-1 flex items-center gap-1.5">
-                <i data-lucide="clapperboard" class="w-3.5 h-3.5"></i>
-                <span>Adegan Pembuka yang Menarik (Cold Open / Hook)</span>
-              </div>
-              <p class="text-xs sm:text-sm text-slate-200 leading-relaxed">${escapeHtml(script.openingHook)}</p>
-            </div>
-          </div>
-
-          <!-- Pembagian Adegan -->
-          <div class="p-6 sm:p-8 space-y-8">
-            ${(script.scenes || []).map((scene, sIdx) => `
-              <div class="rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-studio-950/40 overflow-hidden">
-                <!-- Scene Heading Bar -->
-                <div class="px-5 py-3.5 bg-slate-200/70 dark:bg-studio-850 border-b border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                  <div class="font-mono font-bold text-xs sm:text-sm text-slate-900 dark:text-amber-300">
-                    ADEGAN ${scene.sceneNumber || sIdx + 1} • ${escapeHtml(scene.heading)}
-                  </div>
-                  <button onclick="aiGenerateSceneIllustration(${epNum}, ${sIdx})"
-                    class="px-3 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs flex items-center gap-1.5 self-start sm:self-auto transition-colors">
-                    <i data-lucide="image" class="w-3.5 h-3.5"></i>
-                    <span>Ilustrasi Adegan AI</span>
-                  </button>
-                </div>
-
-                <div class="p-5 space-y-4">
-                  <!-- Metadata Grid -->
-                  <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
-                    <div class="p-3 rounded-xl bg-white dark:bg-studio-900 border border-slate-200/70 dark:border-slate-800">
-                      <span class="font-bold text-slate-400 uppercase block text-[10px] mb-0.5">Deskripsi Lokasi</span>
-                      <span class="text-slate-700 dark:text-slate-300">${escapeHtml(scene.locationDesc)}</span>
-                    </div>
-                    <div class="p-3 rounded-xl bg-white dark:bg-studio-900 border border-slate-200/70 dark:border-slate-800">
-                      <span class="font-bold text-slate-400 uppercase block text-[10px] mb-0.5">Karakter yang Tampil</span>
-                      <div class="flex flex-wrap gap-1.5 mt-1">
-                        ${(scene.charactersPresent || []).map(cName => `
-                          <span class="px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-700 dark:text-amber-300 font-semibold">${escapeHtml(cName)}</span>
-                        `).join('')}
-                      </div>
-                    </div>
-                    <div class="p-3 rounded-xl bg-white dark:bg-studio-900 border border-slate-200/70 dark:border-slate-800">
-                      <span class="font-bold text-sky-500 uppercase block text-[10px] mb-0.5">Arahan Gerakan Kamera & Visual</span>
-                      <span class="text-slate-700 dark:text-slate-300">${escapeHtml(scene.cameraDirection)} — ${escapeHtml(scene.visualDesc)}</span>
-                    </div>
-                    <div class="p-3 rounded-xl bg-white dark:bg-studio-900 border border-slate-200/70 dark:border-slate-800">
-                      <span class="font-bold text-purple-500 uppercase block text-[10px] mb-0.5">Musik & Suasana Pendukung</span>
-                      <span class="text-slate-700 dark:text-slate-300">${escapeHtml(scene.musicAmbience)}</span>
-                    </div>
-                  </div>
-
-                  <!-- Narasi -->
-                  ${scene.narration ? `
-                    <div class="p-3.5 rounded-xl bg-amber-500/5 border-l-4 border-amber-500 italic text-xs sm:text-sm text-slate-700 dark:text-slate-300">
-                      <strong class="not-italic text-amber-600 dark:text-amber-400 text-xs uppercase mr-1">Narasi:</strong>
-                      ${escapeHtml(scene.narration)}
-                    </div>
-                  ` : ''}
-
-                  <!-- Dialog Lengkap Setiap Tokoh -->
-                  <div class="space-y-3 pt-2">
-                    <div class="text-[11px] font-bold uppercase tracking-wider text-slate-400">Dialog & Ekspresi Tokoh</div>
-                    ${(scene.dialogue || []).map(d => `
-                      <div class="pl-4 sm:pl-8 pr-2 py-2 rounded-xl bg-white dark:bg-studio-900/90 border border-slate-100 dark:border-slate-800/80">
-                        <div class="flex flex-wrap items-center gap-2 mb-1">
-                          <span class="font-mono font-bold text-xs sm:text-sm uppercase text-slate-900 dark:text-amber-300">${escapeHtml(d.character)}</span>
-                          <span class="text-[11px] italic px-2 py-0.5 rounded-full bg-slate-100 dark:bg-studio-800 text-slate-500 dark:text-slate-400">
-                            (${escapeHtml(d.emotion)})
-                          </span>
-                        </div>
-                        <p class="text-sm text-slate-800 dark:text-slate-100 leading-relaxed">"${escapeHtml(d.line)}"</p>
-                      </div>
-                    `).join('')}
-                  </div>
-                </div>
-              </div>
-            `).join('')}
-
-            <!-- Adegan Penutup -->
-            <div class="p-5 rounded-2xl bg-gradient-to-r from-rose-950/90 to-studio-900 border border-rose-500/35 text-white">
-              <div class="text-xs font-bold uppercase tracking-wider text-rose-300 mb-1.5 flex items-center gap-1.5">
-                <i data-lucide="alert-circle" class="w-4 h-4"></i>
-                <span>Adegan Penutup (Cliffhanger Penasaran)</span>
-              </div>
-              <p class="text-sm text-slate-200 leading-relaxed">${escapeHtml(script.closingCliffhanger)}</p>
-            </div>
-          </div>
-        </div>
-      `;
-    }
-
-    function renderScriptEditor(script, epNum) {
-      return `
-        <div class="rounded-3xl bg-white dark:bg-studio-900 border-2 border-amber-500 p-6 space-y-5">
-          <div class="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-4">
-            <h3 class="font-serif font-bold text-xl text-amber-500">Mode Edit Naskah Langsung — Episode ${epNum}</h3>
-            <button onclick="saveEditedScript(${epNum})" class="px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs sm:text-sm flex items-center gap-1.5">
-              <i data-lucide="save" class="w-4 h-4"></i>
-              <span>Simpan Perubahan</span>
-            </button>
-          </div>
-
-          <div class="grid grid-cols-1 gap-4 text-sm">
-            <div>
-              <label class="block text-xs font-bold text-slate-400 mb-1">Judul Episode</label>
-              <input id="edit-ep-title" type="text" value="${escapeHtml(script.title)}" class="w-full px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 font-bold" />
-            </div>
-            <div>
-              <label class="block text-xs font-bold text-slate-400 mb-1">Ringkasan Episode</label>
-              <textarea id="edit-ep-summary" rows="2" class="w-full px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700">${escapeHtml(script.summary)}</textarea>
-            </div>
-            <div>
-              <label class="block text-xs font-bold text-slate-400 mb-1">Adegan Pembuka (Hook)</label>
-              <textarea id="edit-ep-hook" rows="2" class="w-full px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700">${escapeHtml(script.openingHook)}</textarea>
-            </div>
-          </div>
-
-          <div class="space-y-4">
-            ${(script.scenes || []).map((sc, sIdx) => `
-              <div class="p-4 rounded-2xl bg-slate-50 dark:bg-studio-850 border border-slate-200 dark:border-slate-700 space-y-3">
-                <div class="font-bold text-xs text-amber-500">ADEGAN ${sIdx + 1}</div>
-                <input id="edit-sc-head-${sIdx}" type="text" value="${escapeHtml(sc.heading)}" class="w-full px-3 py-2 rounded-xl bg-white dark:bg-studio-900 border border-slate-300 dark:border-slate-700 text-xs font-mono" />
-                <textarea id="edit-sc-narr-${sIdx}" rows="2" placeholder="Narasi..." class="w-full px-3 py-2 rounded-xl bg-white dark:bg-studio-900 border border-slate-300 dark:border-slate-700 text-xs">${escapeHtml(sc.narration || '')}</textarea>
-                <div class="space-y-2">
-                  ${(sc.dialogue || []).map((d, dIdx) => `
-                    <div class="grid grid-cols-1 sm:grid-cols-4 gap-2">
-                      <input id="edit-dlg-char-${sIdx}-${dIdx}" type="text" value="${escapeHtml(d.character)}" class="px-3 py-2 rounded-xl bg-white dark:bg-studio-900 border border-slate-300 dark:border-slate-700 text-xs font-bold" />
-                      <input id="edit-dlg-emo-${sIdx}-${dIdx}" type="text" value="${escapeHtml(d.emotion)}" class="px-3 py-2 rounded-xl bg-white dark:bg-studio-900 border border-slate-300 dark:border-slate-700 text-xs italic" />
-                      <input id="edit-dlg-line-${sIdx}-${dIdx}" type="text" value="${escapeHtml(d.line)}" class="sm:col-span-2 px-3 py-2 rounded-xl bg-white dark:bg-studio-900 border border-slate-300 dark:border-slate-700 text-xs" />
-                    </div>
-                  `).join('')}
-                </div>
-              </div>
-            `).join('')}
-          </div>
-
-          <div>
-            <label class="block text-xs font-bold text-rose-400 mb-1">Adegan Penutup (Cliffhanger)</label>
-            <textarea id="edit-ep-cliff" rows="2" class="w-full px-4 py-2.5 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm">${escapeHtml(script.closingCliffhanger)}</textarea>
-          </div>
-        </div>
-      `;
-    }
-
-    function toggleEditScriptMode() {
-      appState.isEditingScript = !appState.isEditingScript;
-      renderApp();
-    }
-
-    function saveEditedScript(epNum) {
-      const proj = getActiveProject();
-      const script = proj.scripts?.[epNum];
-      if (!script) return;
-
-      script.title = document.getElementById('edit-ep-title').value;
-      script.summary = document.getElementById('edit-ep-summary').value;
-      script.openingHook = document.getElementById('edit-ep-hook').value;
-      script.closingCliffhanger = document.getElementById('edit-ep-cliff').value;
-
-      (script.scenes || []).forEach((sc, sIdx) => {
-        const headEl = document.getElementById(`edit-sc-head-${sIdx}`);
-        const narrEl = document.getElementById(`edit-sc-narr-${sIdx}`);
-        if (headEl) sc.heading = headEl.value;
-        if (narrEl) sc.narration = narrEl.value;
-
-        (sc.dialogue || []).forEach((d, dIdx) => {
-          const charEl = document.getElementById(`edit-dlg-char-${sIdx}-${dIdx}`);
-          const emoEl = document.getElementById(`edit-dlg-emo-${sIdx}-${dIdx}`);
-          const lineEl = document.getElementById(`edit-dlg-line-${sIdx}-${dIdx}`);
-          if (charEl) d.character = charEl.value;
-          if (emoEl) d.emotion = emoEl.value;
-          if (lineEl) d.line = lineEl.value;
-        });
-      });
-
-      appState.isEditingScript = false;
-      saveState();
-      renderApp();
-      showToast('Perubahan naskah berhasil disimpan!', 'success');
-    }
-
-    const SCRIPT_JSON_SCHEMA = {
+    const SCRIPT_SCHEMA = {
       type: "OBJECT",
       properties: {
         episodeNumber: { type: "INTEGER" },
@@ -2555,545 +1231,180 @@ Jumlah episode yang wajib dibuat: tepat ${s.episodeCount} episode (nomor 1 sampa
 
     async function aiGenerateEpisodeScript(epNum) {
       const proj = getActiveProject();
-      const s = proj.settings;
-      const genre = proj.customGenre || proj.genre;
-      const outline = proj.storyArc?.episodes?.find(e => Number(e.episodeNumber) === epNum);
-      const prevScript = epNum > 1 ? proj.scripts?.[epNum - 1] : null;
-      const charList = (proj.characters || []).map(c => `${c.name} (${c.role}, sifat: ${c.personality})`).join('; ');
+      const epOutline = (proj.storyArc?.episodes || []).find(e => e.episodeNumber === epNum);
+      const prevScript = proj.scripts?.[epNum - 1];
+      const charContext = (proj.characters || [])
+        .map(c => `${c.name} (${c.role}, sifat: ${c.personality}, fisik: ${c.physicalTraits}, pakaian: ${c.clothingStyle})`)
+        .join('\n');
 
-      setLoading(true, `Menulis Naskah Episode ${epNum}...`, 'AI sedang menyusun adegan pembuka, dialog beremosi, arahan kamera, musik, dan cliffhanger.');
+      setLoading(true, `Menulis Naskah Episode ${epNum}...`, 'AI sedang menyusun adegan pembuka, dialog penuh emosi, arahan kamera, dan cliffhanger.');
       try {
-        const scriptData = await callGeminiText({
-          systemPrompt: 'Kamu adalah Penulis Skenario & Sutradara serial drama profesional Indonesia. Tulis naskah episode yang hidup, emosional, sinematik, dengan pembagian adegan jelas, arahan kamera, dan dialog natural.',
-          userPrompt: `Tulis naskah lengkap untuk Episode ${epNum} dari total ${s.episodeCount} episode serial drama "${s.title}" (Genre: ${genre}).
-Latar tempat: ${s.settingPlace} (${s.era}). Suasana: ${s.mood}. Durasi target: ${s.episodeDuration}.
-Karakter tersedia: ${charList || 'Gunakan tokoh utama yang sesuai cerita'}.
-${outline ? `Panduan Alur Episode ${epNum}: Judul "${outline.title}", Ringkasan: ${outline.summary}, Cliffhanger: ${outline.cliffhanger}.` : `Sinopsis Serial: ${s.synopsis}.`}
-${prevScript ? `Kelanjutan dari Episode ${epNum - 1} yang ditutup dengan: "${prevScript.closingCliffhanger}".` : 'Ini adalah episode perdana yang harus langsung memikat penonton.'}
-Buat minimal 3 hingga 4 adegan lengkap beserta dialog, ekspresi emosi, gerakan kamera, dan musik suasana.`,
-          responseSchema: SCRIPT_JSON_SCHEMA
+        const data = await callGeminiText({
+          systemPrompt: 'Anda adalah Penulis Naskah Drama Sinematik profesional Indonesia. Tulis naskah episode lengkap yang terhubung erat dengan episode sebelumnya dan alur utama serial. Gunakan dialog alami berbahasa Indonesia yang menyentuh dan kuat.',
+          userPrompt: `Judul Serial: "${proj.settings.title}" (${proj.customGenre.trim() || proj.genre})
+Sinopsis Utama: "${proj.storyArc?.fullSynopsis || proj.settings.synopsis}"
+Konflik Utama: "${proj.storyArc?.mainConflict || ''}"
+Plot Twist Serial: "${proj.storyArc?.plotTwist || ''}"
+Karakter & Ciri Konsisten:
+${charContext}
+
+Target Penulisan: EPISODE ${epNum} dari ${proj.settings.episodeCount}
+Judul Episode: "${epOutline?.title || `Episode ${epNum}`}"
+Ringkasan Alur Episode ${epNum}: "${epOutline?.summary || ''}"
+Keterkaitan dengan Cerita Utama: "${epOutline?.connectionToMainArc || ''}"
+Target Cliffhanger Akhir Episode: "${epOutline?.cliffhanger || ''}"
+${prevScript ? `Ringkasan & Cliffhanger Episode ${epNum - 1} sebelumnya (lanjutkan secara mulus): "${prevScript.closingCliffhanger}"` : 'Ini adalah Episode 1 (pembuka serial).'}
+
+Buat minimal 4 sampai 6 adegan yang kaya detail visual, arahan kamera, dan dialog mendalam.`,
+          responseSchema: SCRIPT_SCHEMA
         });
 
-        scriptData.episodeNumber = epNum;
-        proj.scripts[epNum] = scriptData;
+        data.episodeNumber = epNum;
+        if (!proj.scripts) proj.scripts = {};
+        proj.scripts[epNum] = data;
+        appState.selectedEpisodeNumber = epNum;
         appState.isEditingScript = false;
         saveState();
         renderApp();
-        showToast(`Naskah Episode ${epNum} berhasil dibuat!`, 'success');
+        showToast(`Naskah Episode ${epNum}: "${data.title}" selesai dibuat!`, 'success');
       } catch (err) {
-        showToast('Gagal membuat naskah episode: ' + err.message, 'error');
+        showToast('Gagal menulis naskah episode: ' + err.message, 'error');
       } finally {
         setLoading(false);
       }
     }
 
-    async function aiRefineEpisodeScript(epNum, mode, customInstruction = '') {
+    async function aiModifyEpisodeScript(epNum, mode) {
       const proj = getActiveProject();
-      const currentScript = proj.scripts?.[epNum];
-      if (!currentScript) return;
-
-      const modeDescriptions = {
-        dialogue: 'Memperdalam dialog agar lebih emosional, puitis, tajam, dan berkarakter tanpa mengubah alur utama.',
-        extend: 'Memperpanjang cerita dengan menambahkan 2 adegan baru yang memperkaya pengembangan karakter dan ketegangan emosional.',
-        conflict: `Mengubah dan mempertajam konflik dalam episode ini sesuai arahan: "${customInstruction}".`
-      };
-
-      setLoading(true, 'Menyempurnakan Naskah Episode...', modeDescriptions[mode]);
-      try {
-        const refined = await callGeminiText({
-          systemPrompt: 'Kamu adalah Script Doctor & Penulis Skenario Drama senior. Revisi naskah yang diberikan sesuai instruksi dengan menjaga konsistensi nama tokoh, latar, dan keterkaitan cerita.',
-          userPrompt: `Revisi naskah Episode ${epNum} berikut ini.
-Tugas Revisi: ${modeDescriptions[mode]}
-Naskah Saat Ini (JSON):
-${JSON.stringify(currentScript)}`,
-          responseSchema: SCRIPT_JSON_SCHEMA
-        });
-
-        refined.episodeNumber = epNum;
-        proj.scripts[epNum] = refined;
-        saveState();
-        renderApp();
-        showToast('Naskah episode berhasil diperbarui oleh AI!', 'success');
-      } catch (err) {
-        showToast('Gagal merevisi naskah: ' + err.message, 'error');
-      } finally {
-        setLoading(false);
-      }
-    }
-
-    function openChangeConflictModal(epNum) {
-      openModal(`
-        <h3 class="font-serif font-bold text-xl mb-2">Ubah Konflik Episode ${epNum}</h3>
-        <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mb-4">
-          Jelaskan arah konflik baru atau kejutan dramatis yang ingin Anda masukkan ke dalam episode ini.
-        </p>
-        <textarea id="conflict-custom-input" rows="3" placeholder="Contoh: Tambahkan pengkhianatan dari sahabat dekat tokoh utama, atau munculnya rahasia surat wasiat yang memicu pertengkaran hebat..."
-          class="w-full px-4 py-3 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm mb-4"></textarea>
-        <div class="flex justify-end gap-2">
-          <button onclick="closeModal()" class="px-4 py-2 rounded-xl bg-slate-200 dark:bg-studio-800 text-sm font-semibold">Batal</button>
-          <button onclick="submitChangeConflict(${epNum})" class="px-5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-sm font-bold">Terapkan Konflik Baru</button>
-        </div>
-      `);
-    }
-
-    async function submitChangeConflict(epNum) {
-      const val = document.getElementById('conflict-custom-input').value.trim();
-      if (!val) {
-        showToast('Tuliskan arah konflik baru terlebih dahulu.', 'warning');
+      const existingScript = proj.scripts?.[epNum];
+      if (!existingScript) {
+        await aiGenerateEpisodeScript(epNum);
         return;
       }
-      closeModal();
-      await aiRefineEpisodeScript(epNum, 'conflict', val);
-    }
 
-    async function continueToNextEpisode(currentEpNum) {
-      const proj = getActiveProject();
-      const nextEp = currentEpNum + 1;
-      if (nextEp > Number(proj.settings.episodeCount)) return;
+      const modeInstructions = {
+        dialog: {
+          title: 'Membuat Ulang Dialog Episode...',
+          sub: 'AI sedang mempertajam emosi, subteks, dan kealamian dialog antar karakter.',
+          instruction: 'Pertahankan struktur adegan dan alur cerita episode ini, namun TULIS ULANG seluruh dialog agar jauh lebih emosional, tajam, alami, dan menyentuh hati.'
+        },
+        extend: {
+          title: 'Memperpanjang Cerita Episode...',
+          sub: 'AI sedang menambahkan adegan baru dan memperdalam konflik emosional.',
+          instruction: 'PERPANJANG cerita episode ini dengan menambahkan 2 hingga 3 adegan baru yang memperkaya dinamika antar tokoh, memperdalam latar belakang, dan memperpanjang durasi dialog tanpa merusak kesinambungan dengan episode berikutnya.'
+        },
+        conflict: {
+          title: 'Mengubah & Mempertajam Konflik...',
+          sub: 'AI sedang menyuntikkan ketegangan dramatis dan dilema baru.',
+          instruction: 'UBAH DAN PERTAJAM konflik dalam episode ini agar taruhannya lebih tinggi, lebih mengejutkan, dan membuat dilema karakter semakin sulit namun tetap terhubung ke alur utama serial.'
+        }
+      };
 
-      appState.selectedEpisodeNumber = nextEp;
-      saveState();
-      if (!proj.scripts?.[nextEp]) {
-        await aiGenerateEpisodeScript(nextEp);
-      } else {
-        renderApp();
-        showToast(`Berpindah ke Episode ${nextEp}.`, 'info');
-      }
-    }
-
-    function stopEpisodeAudio() {
-      if (appState.currentAudio) {
-        try {
-          appState.currentAudio.pause();
-        } catch (e) {}
-        appState.currentAudio = null;
-      }
-      if ('speechSynthesis' in window) {
-        try {
-          window.speechSynthesis.cancel();
-        } catch (e) {}
-      }
-      if (appState.audioPlayer?.audioUrl) {
-        try {
-          URL.revokeObjectURL(appState.audioPlayer.audioUrl);
-        } catch (e) {}
-      }
-      appState.audioPlayer = null;
-      renderApp();
-    }
-
-    function playBrowserSpeechFallback(epNum) {
-      const proj = getActiveProject();
-      const script = proj.scripts?.[epNum];
-      if (!script || !('speechSynthesis' in window)) return;
-
-      window.speechSynthesis.cancel();
-      const firstScene = script.scenes?.[0];
-      const sampleDialogue = firstScene?.dialogue?.slice(0, 3).map(d => `${d.character}. ${d.line}`).join('. ') || '';
-      const textToRead = `Episode ${epNum}: ${script.title}. ${script.openingHook}. ${sampleDialogue}`;
-
-      const utterance = new SpeechSynthesisUtterance(textToRead);
-      utterance.lang = 'id-ID';
-      utterance.rate = 0.96;
-      const voices = window.speechSynthesis.getVoices();
-      const idVoice = voices.find(v => v.lang && v.lang.toLowerCase().includes('id'));
-      if (idVoice) utterance.voice = idVoice;
-      window.speechSynthesis.speak(utterance);
-    }
-
-    async function playEpisodeAudioPreview(epNum) {
-      const proj = getActiveProject();
-      const script = proj.scripts?.[epNum];
-      if (!script) return;
-
-      stopEpisodeAudio();
-
-      const firstScene = script.scenes?.[0];
-      const sampleDialogue = firstScene?.dialogue?.slice(0, 3).map(d => `${d.character}: ${d.line}`).join('. ') || '';
-      const textToRead = `Episode ${epNum}: ${script.title}. ${script.openingHook}. ${sampleDialogue}`;
-      const chosenVoice = appState.selectedVoice || 'Kore';
-
-      setLoading(true, 'Menyiapkan Pembacaan Dramatis (AI Voice)...', 'Sedang menghasilkan audio narasi dan cuplikan dialog pembuka.');
+      const cfg = modeInstructions[mode] || modeInstructions.dialog;
+      setLoading(true, cfg.title, cfg.sub);
       try {
-        const audioUrl = await callGeminiTTS(textToRead, chosenVoice);
-        appState.audioPlayer = {
-          epNum,
-          title: script.title,
-          audioUrl,
-          voiceName: chosenVoice,
-          isFallback: false
-        };
-        setLoading(false);
-        renderApp();
+        const data = await callGeminiText({
+          systemPrompt: 'Anda adalah Script Doctor & Penulis Skenario Serial Drama Indonesia. Revisi naskah episode berikut sesuai instruksi dengan tetap menjaga konsistensi karakter dan kesinambungan serial.',
+          userPrompt: `Instruksi Revisi: ${cfg.instruction}
 
-        const audioEl = document.getElementById('episode-tts-audio');
-        if (audioEl) {
-          appState.currentAudio = audioEl;
-          audioEl.play().catch(() => {
-            showToast('Audio siap! Tekan tombol Play pada pemutar di atas jika browser menahan putar otomatis.', 'info');
-          });
-        }
-        showToast('Audio pembacaan naskah siap diputar!', 'success');
-      } catch (err) {
-        setLoading(false);
-        if ('speechSynthesis' in window) {
-          appState.audioPlayer = {
-            epNum,
-            title: script.title,
-            audioUrl: '',
-            voiceName: 'Browser ID',
-            isFallback: true
-          };
-          renderApp();
-          playBrowserSpeechFallback(epNum);
-          showToast('Memutar pembacaan naskah menggunakan suara Bahasa Indonesia perangkat Anda.', 'info');
-        } else {
-          showToast('Audio tidak dapat diputar di perangkat ini: ' + err.message, 'error');
-        }
-      }
-    }
-
-    function copyEpisodeScriptText(epNum) {
-      const proj = getActiveProject();
-      const s = proj.scripts?.[epNum];
-      if (!s) return;
-      let text = `${proj.settings.title.toUpperCase()}\nEPISODE ${s.episodeNumber}: ${s.title}\n\nRINGKASAN:\n${s.summary}\n\nADEGAN PEMBUKA:\n${s.openingHook}\n\n`;
-      (s.scenes || []).forEach(sc => {
-        text += `----------------------------------------\nADEGAN ${sc.sceneNumber} - ${sc.heading}\nLokasi: ${sc.locationDesc}\nKarakter: ${(sc.charactersPresent || []).join(', ')}\nKamera & Visual: ${sc.cameraDirection} | ${sc.visualDesc}\nMusik: ${sc.musicAmbience}\n\nNarasi: ${sc.narration}\n\n`;
-        (sc.dialogue || []).forEach(d => {
-          text += `${d.character.toUpperCase()} (${d.emotion}):\n"${d.line}"\n\n`;
+Naskah Episode ${epNum} Saat Ini:
+${JSON.stringify(existingScript)}`,
+          responseSchema: SCRIPT_SCHEMA
         });
-      });
-      text += `----------------------------------------\nADEGAN PENUTUP (CLIFFHANGER):\n${s.closingCliffhanger}`;
-      copyTextToClipboard(text);
+
+        data.episodeNumber = epNum;
+        proj.scripts[epNum] = data;
+        saveState();
+        renderApp();
+        showToast(`Naskah Episode ${epNum} berhasil diperbarui!`, 'success');
+      } catch (err) {
+        showToast('Gagal memodifikasi naskah: ' + err.message, 'error');
+      } finally {
+        setLoading(false);
+      }
     }
 
     /**
      * =========================================================================
-     * 11. RENDER HALAMAN G: GENERATOR GAMBAR AI & STUDIO VISUAL
+     * 7. GENERATOR GAMBAR AI & UNDUH GAMBAR RAMAH HP
      * =========================================================================
      */
-    function renderVisualsView() {
+    async function aiGenerateVisualAsset() {
       const proj = getActiveProject();
+      const category = document.getElementById('vis-category')?.value || 'Poster utama serial';
+      const styleId = document.getElementById('vis-style')?.value || VISUAL_STYLES[0].id;
+      const targetVal = document.getElementById('vis-target')?.value || '';
+      const aspectRatio = document.getElementById('vis-aspect')?.value || '3:4';
+      const customNote = document.getElementById('vis-custom-note')?.value || '';
+
+      const styleObj = VISUAL_STYLES.find(s => s.id === styleId) || VISUAL_STYLES[0];
       const chars = proj.characters || [];
-      const totalEps = Number(proj.settings.episodeCount) || 5;
-      const gallery = proj.gallery || [];
+      const refImages = chars.map(c => c.imageUrl).filter(Boolean);
+      const charConsistencyText = chars.map(c =>
+        `${c.name} (${c.role}): ${c.physicalTraits}, wearing ${c.clothingStyle}`
+      ).join('; ');
 
-      return `
-        <div class="space-y-8 animate-fade-in">
-          <div>
-            <span class="text-xs font-bold uppercase tracking-wider text-amber-500">Tahap 5 • Visualisasi Sinematik & Poster Resmi</span>
-            <h1 class="font-serif font-bold text-2xl sm:text-3xl mt-1">Generator Gambar AI & Studio Poster</h1>
-          </div>
+      let subjectPrompt = '';
+      let displayTitle = `${category} - ${proj.settings.title}`;
 
-          <!-- GENERATOR CONTROLS CARD -->
-          <section class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-6">
-            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-              <!-- Jenis Gambar -->
-              <div>
-                <label class="block text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">1. Pilih Kategori Gambar</label>
-                <select id="vis-category" onchange="handleVisualCategoryChange()"
-                  class="w-full px-4 py-3 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm font-semibold focus:outline-none focus:border-amber-500">
-                  <option value="Poster utama serial">Poster utama serial</option>
-                  <option value="Foto setiap karakter">Foto setiap karakter</option>
-                  <option value="Ilustrasi setiap adegan">Ilustrasi setiap adegan</option>
-                  <option value="Background lokasi">Background lokasi</option>
-                  <option value="Gambar thumbnail episode">Gambar thumbnail episode</option>
-                  <option value="Sampul setiap episode">Sampul setiap episode</option>
-                </select>
-              </div>
-
-              <!-- Gaya Visual -->
-              <div>
-                <label class="block text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">2. Pilih Gaya Visual</label>
-                <select id="vis-style"
-                  class="w-full px-4 py-3 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm font-semibold focus:outline-none focus:border-amber-500">
-                  ${VISUAL_STYLES.map(st => `<option value="${st.id}">${st.name}</option>`).join('')}
-                </select>
-              </div>
-
-              <!-- Rasio Aspek -->
-              <div>
-                <label class="block text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">3. Rasio & Format Frame</label>
-                <select id="vis-ratio"
-                  class="w-full px-4 py-3 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm font-semibold focus:outline-none focus:border-amber-500">
-                  <option value="3:4">3:4 (Poster / Sampul Vertikal)</option>
-                  <option value="16:9">16:9 (Layar Lebar / Adegan / Thumbnail)</option>
-                  <option value="1:1">1:1 (Persegi / Profil Karakter)</option>
-                  <option value="9:16">9:16 (Vertical Story / Reels)</option>
-                </select>
-              </div>
-
-              <!-- Sub-pilihan Konteks -->
-              <div id="vis-context-wrapper">
-                <label class="block text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">Target Karakter / Episode</label>
-                <select id="vis-target-select"
-                  class="w-full px-4 py-3 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500">
-                  <option value="all">Seluruh Tokoh Utama Serial</option>
-                  ${chars.map(c => `<option value="char:${c.id}">Karakter: ${escapeHtml(c.name)}</option>`).join('')}
-                  ${Array.from({ length: totalEps }, (_, i) => i + 1).map(n => `<option value="ep:${n}">Episode ${n}</option>`).join('')}
-                </select>
-              </div>
-
-              <!-- Deskripsi Tambahan -->
-              <div class="md:col-span-2">
-                <label class="block text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-1.5">Arahan Adegan / Detail Visual Tambahan</label>
-                <input id="vis-custom-prompt" type="text"
-                  placeholder="Contoh: Dua tokoh berdiri di dermaga saat hujan senja dengan tatapan penuh haru..."
-                  class="w-full px-4 py-3 rounded-xl bg-slate-50 dark:bg-studio-850 border border-slate-300 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500" />
-              </div>
-            </div>
-
-            <div class="mt-6 pt-5 border-t border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-              <div class="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-                <i data-lucide="user-check" class="w-4 h-4 text-amber-500 shrink-0"></i>
-                <span>Referensi wajah & pakaian karakter aktif akan disertakan otomatis untuk konsistensi visual.</span>
-              </div>
-              <button onclick="executeCustomVisualGeneration()"
-                class="px-6 py-3.5 rounded-2xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-sm shadow-lg shadow-amber-500/20 flex items-center justify-center gap-2">
-                <i data-lucide="sparkles" class="w-4 h-4"></i>
-                <span>Generate Gambar AI</span>
-              </button>
-            </div>
-          </section>
-
-          <!-- GALLERY KOLEKSI VISUAL SERIAL -->
-          <section>
-            <div class="flex items-center justify-between mb-4">
-              <h2 class="font-serif font-bold text-xl">Galeri Karya Visual Serial (${gallery.length})</h2>
-            </div>
-
-            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-              ${gallery.map(item => `
-                <div class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 overflow-hidden shadow-sm flex flex-col">
-                  <div class="aspect-video relative bg-slate-900 overflow-hidden group">
-                    ${item.imageUrl
-                      ? `<img src="${item.imageUrl}" alt="${escapeHtml(item.title)}" class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300">`
-                      : `<div class="w-full h-full p-5 flex flex-col justify-between bg-gradient-to-br from-amber-900/50 via-studio-900 to-slate-950">
-                          <span class="text-[10px] font-bold uppercase tracking-widest text-amber-400">${escapeHtml(item.category)}</span>
-                          <div>
-                            <div class="font-serif font-bold text-base text-white mb-2">${escapeHtml(item.title)}</div>
-                            <button onclick="executeCustomVisualGeneration()" class="px-3 py-1.5 rounded-xl bg-amber-500 text-slate-950 font-bold text-xs">
-                              Generate Visual AI Sekarang
-                            </button>
-                          </div>
-                        </div>`
-                    }
-                    <span class="absolute top-3 left-3 px-2.5 py-1 rounded-full text-[10px] font-bold bg-slate-950/80 text-amber-300 backdrop-blur-md border border-amber-500/30">
-                      ${escapeHtml(item.category)}
-                    </span>
-                  </div>
-
-                  <div class="p-4 flex-1 flex flex-col justify-between gap-3">
-                    <div>
-                      <h3 class="font-bold text-sm text-slate-900 dark:text-white mb-0.5">${escapeHtml(item.title)}</h3>
-                      <p class="text-[11px] text-amber-600 dark:text-amber-400">${escapeHtml(item.styleName || '')}</p>
-                    </div>
-
-                    ${item.imageUrl ? `
-                      <div class="flex items-center gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
-                        <button onclick="downloadGalleryImage('${item.id}')"
-                          class="flex-1 py-2 px-3 rounded-xl bg-slate-100 dark:bg-studio-800 hover:bg-amber-500 hover:text-slate-950 text-xs font-semibold text-center transition-colors flex items-center justify-center gap-1.5">
-                          <i data-lucide="download" class="w-3.5 h-3.5"></i>
-                          <span>Unduh Gambar</span>
-                        </button>
-                        <button onclick="shareGalleryImage('${item.id}')" class="p-2 rounded-xl bg-slate-100 dark:bg-studio-800 hover:text-amber-500 transition-colors" title="Simpan ke Galeri / Bagikan di HP">
-                          <i data-lucide="share-2" class="w-4 h-4"></i>
-                        </button>
-                        <button onclick="previewImageFullscreen('${item.id}')" class="p-2 rounded-xl bg-slate-100 dark:bg-studio-800 hover:text-amber-500 transition-colors" title="Perbesar">
-                          <i data-lucide="maximize-2" class="w-4 h-4"></i>
-                        </button>
-                      </div>
-                    ` : ''}
-                  </div>
-                </div>
-              `).join('')}
-            </div>
-          </section>
-        </div>
-      `;
-    }
-
-    function dataUrlToBlob(dataUrl) {
-      if (!dataUrl || typeof dataUrl !== 'string') {
-        throw new Error('Sumber gambar tidak valid.');
-      }
-      if (!dataUrl.startsWith('data:')) {
-        throw new Error('Format gambar bukan data URL.');
-      }
-      const commaIndex = dataUrl.indexOf(',');
-      if (commaIndex === -1) {
-        throw new Error('Data gambar tidak lengkap.');
-      }
-      const header = dataUrl.slice(0, commaIndex);
-      const base64Body = dataUrl.slice(commaIndex + 1).replace(/\s+/g, '');
-      const mimeMatch = header.match(/data:([^;]+)/i);
-      const mimeType = mimeMatch ? mimeMatch[1] : 'image/png';
-
-      const binaryStr = atob(base64Body);
-      const len = binaryStr.length;
-      const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) {
-        bytes[i] = binaryStr.charCodeAt(i);
-      }
-      return new Blob([bytes], { type: mimeType });
-    }
-
-    function sanitizeImageFilename(rawTitle, mimeType = 'image/png') {
-      const ext = mimeType.includes('jpeg') || mimeType.includes('jpg') ? 'jpg' : 'png';
-      const clean = String(rawTitle || 'DramaStudioAI_Visual')
-        .replace(/[^a-zA-Z0-9_-]+/g, '_')
-        .replace(/^_+|_+$/g, '')
-        .slice(0, 60) || 'DramaStudioAI_Visual';
-      return `${clean}.${ext}`;
-    }
-
-    function downloadDataUrlImage(dataUrl, rawFilename) {
-      try {
-        const blob = dataUrlToBlob(dataUrl);
-        const filename = sanitizeImageFilename(rawFilename, blob.type);
-        const blobUrl = URL.createObjectURL(blob);
-
-        const link = document.createElement('a');
-        link.style.display = 'none';
-        link.href = blobUrl;
-        link.download = filename;
-        link.rel = 'noopener';
-        document.body.appendChild(link);
-        link.click();
-
-        setTimeout(() => {
-          if (link.parentNode) {
-            document.body.removeChild(link);
-          }
-          URL.revokeObjectURL(blobUrl);
-        }, 60000);
-
-        showToast('Mengunduh gambar... Jika di HP tidak otomatis tersimpan, tekan tombol Bagikan atau tekan lama pada gambar.', 'success');
-      } catch (err) {
-        showToast('Gagal menyiapkan unduhan gambar: ' + err.message, 'error');
-      }
-    }
-
-    async function shareDataUrlImage(dataUrl, rawFilename, titleText = 'Visual Drama Studio AI') {
-      try {
-        const blob = dataUrlToBlob(dataUrl);
-        const filename = sanitizeImageFilename(rawFilename, blob.type);
-        const file = new File([blob], filename, { type: blob.type });
-
-        if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
-          await navigator.share({
-            files: [file],
-            title: titleText,
-            text: `Visual dari DRAMA STUDIO AI: ${titleText}`
-          });
-          showToast('Berhasil membuka menu simpan/bagikan HP!', 'success');
-        } else {
-          downloadDataUrlImage(dataUrl, rawFilename);
-        }
-      } catch (err) {
-        if (err && err.name !== 'AbortError') {
-          downloadDataUrlImage(dataUrl, rawFilename);
-        }
-      }
-    }
-
-    function downloadGalleryImage(imgId) {
-      const proj = getActiveProject();
-      const item = (proj.gallery || []).find(g => g.id === imgId);
-      if (!item || !item.imageUrl) {
-        showToast('Gambar belum tersedia untuk diunduh.', 'warning');
-        return;
-      }
-      downloadDataUrlImage(item.imageUrl, item.title);
-    }
-
-    function shareGalleryImage(imgId) {
-      const proj = getActiveProject();
-      const item = (proj.gallery || []).find(g => g.id === imgId);
-      if (!item || !item.imageUrl) return;
-      shareDataUrlImage(item.imageUrl, item.title, item.title);
-    }
-
-    function handleVisualCategoryChange() {
-      const cat = document.getElementById('vis-category').value;
-      const ratioEl = document.getElementById('vis-ratio');
-      if (cat === 'Poster utama serial' || cat === 'Sampul setiap episode' || cat === 'Foto setiap karakter') {
-        ratioEl.value = '3:4';
-      } else {
-        ratioEl.value = '16:9';
-      }
-    }
-
-    async function executeCustomVisualGeneration() {
-      const proj = getActiveProject();
-      const s = proj.settings;
-      const category = document.getElementById('vis-category').value;
-      const styleId = document.getElementById('vis-style').value;
-      const aspectRatio = document.getElementById('vis-ratio').value;
-      const targetVal = document.getElementById('vis-target-select').value;
-      const customNote = document.getElementById('vis-custom-prompt').value.trim();
-
-      const styleObj = VISUAL_STYLES.find(st => st.id === styleId) || VISUAL_STYLES[0];
-      const chars = proj.characters || [];
-
-      let refImages = [];
-      let characterConsistencyDesc = '';
-      let displayTitle = `${category}: ${s.title}`;
-
-      if (targetVal.startsWith('char:')) {
-        const cId = targetVal.split(':')[1];
-        const char = chars.find(c => c.id === cId);
-        if (char) {
-          displayTitle = `${category} - ${char.name}`;
-          characterConsistencyDesc = `Main Character featured: ${char.name} (${char.age}, ${char.gender}), Physical features: ${char.physicalTraits}, Wearing exact outfit: ${char.clothingStyle}.`;
-          if (char.imageUrl) refImages.push(char.imageUrl);
-        }
-      } else if (targetVal.startsWith('ep:')) {
-        const epNum = Number(targetVal.split(':')[1]);
-        const epOutline = proj.storyArc?.episodes?.find(e => Number(e.episodeNumber) === epNum);
-        displayTitle = `${category} - Ep ${epNum}${epOutline ? ': ' + epOutline.title : ''}`;
-        characterConsistencyDesc = chars.slice(0, 2).map(c => {
-          if (c.imageUrl) refImages.push(c.imageUrl);
-          return `${c.name} (${c.physicalTraits}, wearing ${c.clothingStyle})`;
-        }).join('; ');
-      } else {
-        characterConsistencyDesc = chars.slice(0, 3).map(c => {
-          if (c.imageUrl) refImages.push(c.imageUrl);
-          return `${c.name} (${c.physicalTraits}, wearing ${c.clothingStyle})`;
-        }).join('; ');
-      }
-
-      let prompt = '';
       if (category === 'Poster utama serial') {
-        prompt = `Official theatrical drama series poster for "${s.title}".
-Genre: ${proj.customGenre || proj.genre}. Setting: ${s.settingPlace} (${s.era}). Mood: ${s.mood}.
-Characters shown with consistent faces and outfits: ${characterConsistencyDesc}.
-${customNote ? 'Additional composition details: ' + customNote : ''}
-Include elegant cinematic Indonesian title typography "${s.title}" prominently on the poster.
-Visual Style: ${styleObj.prompt}.`;
-      } else if (category === 'Sampul setiap episode') {
-        prompt = `Official episode cover artwork for drama series "${s.title}", ${displayTitle}.
-Characters consistent visual reference: ${characterConsistencyDesc}.
-Setting: ${s.settingPlace}. ${customNote}.
-Include clean dramatic title typography "${displayTitle}".
-Visual Style: ${styleObj.prompt}.`;
+        subjectPrompt = `Official theatrical & streaming series key art poster for Indonesian drama "${proj.settings.title}" (${proj.customGenre.trim() || proj.genre}).
+Theme: ${proj.settings.theme}.
+Setting: ${proj.settings.settingPlace} (${proj.settings.era}), mood: ${proj.settings.mood}.
+Main cast featured prominently (keep consistent faces & outfits): ${charConsistencyText}.
+Include subtle atmospheric title typography space at top or bottom.`;
+        displayTitle = `Poster Utama: ${proj.settings.title}`;
+      } else if (category === 'Foto setiap karakter') {
+        const charId = targetVal.replace('char:', '');
+        const char = chars.find(c => c.id === charId) || chars[0];
+        if (!char) {
+          showToast('Silakan buat atau pilih karakter terlebih dahulu.', 'warning');
+          return;
+        }
+        subjectPrompt = `Character portrait & costume reference sheet for Indonesian drama "${proj.settings.title}".
+Character: ${char.name}, ${char.age}, ${char.gender}, ${char.role}.
+Exact Physical Appearance: ${char.physicalTraits}.
+Exact Clothing Style: ${char.clothingStyle}.
+Background setting: ${proj.settings.settingPlace} (${proj.settings.era}).`;
+        displayTitle = `Potret Karakter: ${char.name}`;
+      } else if (category === 'Ilustrasi setiap adegan') {
+        const [epStr, scStr] = targetVal.replace('scene:', '').split(':');
+        const epNum = parseInt(epStr, 10) || appState.selectedEpisodeNumber || 1;
+        const scIdx = parseInt(scStr, 10) || 0;
+        const scene = proj.scripts?.[epNum]?.scenes?.[scIdx];
+        if (!scene) {
+          showToast('Adegan naskah tidak ditemukan. Buat naskah episode terlebih dahulu.', 'warning');
+          return;
+        }
+        subjectPrompt = `Cinematic film scene still for "${proj.settings.title}" Episode ${epNum} Scene ${scene.sceneNumber}.
+Location: ${scene.locationDesc} (${proj.settings.era}).
+Visual Action: ${scene.visualDesc}.
+Camera Framing: ${scene.cameraDirection}.
+Characters present (keep exact face & clothing consistency): ${charConsistencyText}.`;
+        displayTitle = `Ep ${epNum} Adegan ${scene.sceneNumber}: ${scene.heading}`;
       } else if (category === 'Background lokasi') {
-        prompt = `Cinematic establishing environment background without people for drama series "${s.title}".
-Location: ${s.settingPlace}, Era: ${s.era}, Mood: ${s.mood}. ${customNote}.
-Visual Style: ${styleObj.prompt}.`;
+        subjectPrompt = `Empty cinematic establishing shot background environment for Indonesian drama "${proj.settings.title}".
+Location: ${proj.settings.settingPlace}, Era: ${proj.settings.era}, Atmosphere: ${proj.settings.mood}.
+Rich architectural & environmental storytelling details, no people in foreground.`;
+        displayTitle = `Latar Lokasi: ${proj.settings.settingPlace}`;
       } else {
-        prompt = `${category} for Indonesian drama series "${s.title}".
-Setting: ${s.settingPlace} (${s.era}), Mood: ${s.mood}.
-Maintain strict facial, physical, and clothing consistency with the provided character references: ${characterConsistencyDesc}.
-Scene action & details: ${customNote || s.synopsis}.
-Visual Style: ${styleObj.prompt}.`;
+        const epNum = parseInt(targetVal.replace('ep:', ''), 10) || 1;
+        const epOutline = (proj.storyArc?.episodes || []).find(e => e.episodeNumber === epNum);
+        subjectPrompt = `${category} for Indonesian drama series "${proj.settings.title}", Episode ${epNum}: "${epOutline?.title || 'Episode ' + epNum}".
+Episode Story: ${epOutline?.summary || proj.settings.synopsis}.
+Setting: ${proj.settings.settingPlace} (${proj.settings.era}).
+Characters (consistent appearance): ${charConsistencyText}.`;
+        displayTitle = `${category} - Ep ${epNum}: ${epOutline?.title || ''}`;
       }
 
-      setLoading(true, `Membuat ${category}...`, 'AI sedang melukis visual sinematik dengan menjaga konsistensi karakter serial Anda.');
+      const fullPrompt = `${subjectPrompt}
+${customNote ? `Additional Director Note: ${customNote}` : ''}
+Visual Style: ${styleObj.prompt}.`;
+
+      setLoading(true, `Membuat ${category}...`, 'AI Sinematografer sedang merender visual berkualitas tinggi.');
       try {
         const imageUrl = await callGeminiImage({
-          prompt,
+          prompt: fullPrompt,
           referenceImages: refImages,
           aspectRatio,
           useAdvanced: true
@@ -3105,12 +1416,13 @@ Visual Style: ${styleObj.prompt}.`;
           if (char) char.imageUrl = imageUrl;
         }
 
+        proj.gallery = (proj.gallery || []).filter(g => !g.isPlaceholderArt);
         proj.gallery.unshift({
           id: 'img_' + Date.now(),
           category,
           title: displayTitle,
           styleName: styleObj.name,
-          prompt,
+          prompt: fullPrompt,
           imageUrl,
           createdAt: new Date().toISOString()
         });
@@ -3132,7 +1444,10 @@ Visual Style: ${styleObj.prompt}.`;
       if (!scene) return;
 
       const charsInScene = (proj.characters || []).filter(c =>
-        (scene.charactersPresent || []).some(name => name.toLowerCase().includes(c.name.toLowerCase()) || c.name.toLowerCase().includes(name.toLowerCase()))
+        (scene.charactersPresent || []).some(name =>
+          name.toLowerCase().includes(c.name.toLowerCase()) ||
+          c.name.toLowerCase().includes(name.toLowerCase())
+        )
       );
 
       const refImages = charsInScene.map(c => c.imageUrl).filter(Boolean);
@@ -3156,18 +1471,8 @@ Style: ${VISUAL_STYLES[0].prompt}.`;
           useAdvanced: true
         });
 
-        proj.gallery.unshift({
-          id: 'img_' + Date.now(),
-          category: 'Ilustrasi setiap adegan',
-          title: `Ep ${epNum} - Adegan ${sceneIdx + 1}: ${scene.heading}`,
-          styleName: 'Realistis seperti film layar lebar',
-          prompt,
-          imageUrl,
-          createdAt: new Date().toISOString()
-        });
-
-        saveState();
         const createdImgId = 'img_' + Date.now();
+        proj.gallery = (proj.gallery || []).filter(g => !g.isPlaceholderArt);
         proj.gallery.unshift({
           id: createdImgId,
           category: 'Ilustrasi setiap adegan',
@@ -3179,31 +1484,8 @@ Style: ${VISUAL_STYLES[0].prompt}.`;
         });
 
         saveState();
-        showToast('Ilustrasi adegan berhasil dibuat! Menampilkan hasil...', 'success');
-
-        openModal(`
-          <div class="flex items-center justify-between mb-3">
-            <h3 class="font-serif font-bold text-lg">Ilustrasi Adegan ${sceneIdx + 1} (Ep ${epNum})</h3>
-            <button onclick="closeModal()" class="p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-studio-800 text-slate-400">
-              <i data-lucide="x" class="w-5 h-5"></i>
-            </button>
-          </div>
-          <img src="${imageUrl}" alt="Ilustrasi Adegan" class="w-full rounded-2xl border border-slate-700 mb-2">
-          <p class="text-[11px] text-slate-400 mb-4">Tips HP: Anda dapat menekan tombol Unduh, Bagikan ke Galeri, atau tekan lama langsung pada gambar di atas.</p>
-          <div class="flex flex-wrap justify-between items-center gap-2">
-            <button onclick="closeModal(); navigateTo('visuals');" class="px-4 py-2 rounded-xl bg-slate-200 dark:bg-studio-800 text-xs font-semibold">Lihat di Galeri Visual</button>
-            <div class="flex items-center gap-2">
-              <button onclick="shareGalleryImage('${createdImgId}')" class="px-3.5 py-2 rounded-xl bg-slate-200 dark:bg-studio-800 text-xs font-bold flex items-center gap-1.5">
-                <i data-lucide="share-2" class="w-3.5 h-3.5"></i>
-                <span>Simpan / Bagikan</span>
-              </button>
-              <button onclick="downloadGalleryImage('${createdImgId}')" class="px-4 py-2 rounded-xl bg-amber-500 text-slate-950 text-xs font-bold flex items-center gap-1.5">
-                <i data-lucide="download" class="w-3.5 h-3.5"></i>
-                <span>Unduh Gambar</span>
-              </button>
-            </div>
-          </div>
-        `);
+        showToast('Ilustrasi adegan berhasil dibuat!', 'success');
+        openImagePreviewModal(createdImgId);
       } catch (err) {
         showToast('Gagal membuat ilustrasi adegan: ' + err.message, 'error');
       } finally {
@@ -3211,93 +1493,1563 @@ Style: ${VISUAL_STYLES[0].prompt}.`;
       }
     }
 
-    function previewImageFullscreen(imgId) {
+    function dataUrlToBlob(dataUrl) {
+      const parts = dataUrl.split(',');
+      const mimeMatch = parts[0].match(/:(.*?);/);
+      const mime = mimeMatch ? mimeMatch[1] : 'image/png';
+      const binary = atob(parts[1]);
+      const len = binary.length;
+      const u8arr = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        u8arr[i] = binary.charCodeAt(i);
+      }
+      return new Blob([u8arr], { type: mime });
+    }
+
+    function downloadImageById(imgId) {
       const proj = getActiveProject();
-      const item = proj.gallery.find(g => g.id === imgId);
+      const item = (proj.gallery || []).find(g => g.id === imgId);
+      if (!item || !item.imageUrl) {
+        showToast('Gambar belum tersedia untuk diunduh.', 'warning');
+        return;
+      }
+
+      try {
+        const blob = dataUrlToBlob(item.imageUrl);
+        const blobUrl = URL.createObjectURL(blob);
+        const safeName = (item.title || 'drama_visual').toLowerCase().replace(/[^a-z0-9]+/g, '_');
+
+        const link = document.createElement('a');
+        link.href = blobUrl;
+        link.download = `${safeName}.png`;
+        link.rel = 'noopener';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+
+        setTimeout(() => {
+          URL.revokeObjectURL(blobUrl);
+        }, 12000);
+
+        showToast('Gambar sedang diunduh ke perangkat Anda!', 'success');
+      } catch (err) {
+        showToast('Gagal mengunduh gambar. Coba gunakan tombol Simpan / Bagikan.', 'error');
+      }
+    }
+
+    async function shareImageById(imgId) {
+      const proj = getActiveProject();
+      const item = (proj.gallery || []).find(g => g.id === imgId);
       if (!item || !item.imageUrl) return;
+
+      try {
+        const blob = dataUrlToBlob(item.imageUrl);
+        const safeName = (item.title || 'drama_visual').toLowerCase().replace(/[^a-z0-9]+/g, '_') + '.png';
+        const file = new File([blob], safeName, { type: 'image/png' });
+
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          await navigator.share({
+            files: [file],
+            title: item.title,
+            text: `Visual Serial Drama: ${proj.settings.title}`
+          });
+          showToast('Gambar berhasil dibagikan / disimpan!', 'success');
+        } else {
+          downloadImageById(imgId);
+        }
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          downloadImageById(imgId);
+        }
+      }
+    }
+
+    function deleteGalleryItem(imgId) {
+      const proj = getActiveProject();
+      proj.gallery = (proj.gallery || []).filter(g => g.id !== imgId);
+      saveState();
+      closeModal();
+      renderApp();
+      showToast('Visual dihapus dari galeri.', 'info');
+    }
+
+    function openImagePreviewModal(imgId) {
+      const proj = getActiveProject();
+      const item = (proj.gallery || []).find(g => g.id === imgId);
+      if (!item) return;
 
       openModal(`
         <div class="flex items-center justify-between mb-3">
           <div>
-            <span class="text-[10px] font-bold uppercase text-amber-500">${escapeHtml(item.category)}</span>
-            <h3 class="font-serif font-bold text-lg">${escapeHtml(item.title)}</h3>
+            <span class="text-[11px] font-semibold uppercase tracking-wider text-amber-500">${escapeHtml(item.category)}</span>
+            <h3 class="font-serif font-bold text-lg text-slate-900 dark:text-white">${escapeHtml(item.title)}</h3>
+          </div>
+          <button onclick="closeModal()" class="p-2 rounded-xl hover:bg-slate-100 dark:hover:bg-studio-800 text-slate-400">
+            <i data-lucide="x" class="w-5 h-5"></i>
+          </button>
+        </div>
+
+        <div class="rounded-2xl overflow-hidden bg-slate-950 border border-slate-800 mb-4 flex items-center justify-center max-h-[62vh]">
+          ${item.imageUrl
+            ? `<img src="${item.imageUrl}" alt="${escapeHtml(item.title)}" class="max-h-[62vh] w-auto object-contain" />`
+            : `<div class="p-10 text-center text-slate-400 text-sm">Belum ada gambar AI. Silakan klik tombol Buat Gambar AI di Studio Visual.</div>`
+          }
+        </div>
+
+        <div class="text-xs text-slate-500 dark:text-slate-400 mb-4">
+          <span class="font-semibold text-slate-700 dark:text-slate-300">Gaya Visual:</span> ${escapeHtml(item.styleName)}
+        </div>
+
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <button onclick="deleteGalleryItem('${item.id}')" class="px-3.5 py-2.5 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 text-rose-500 text-xs font-semibold flex items-center gap-1.5">
+            <i data-lucide="trash-2" class="w-4 h-4"></i>
+            <span>Hapus</span>
+          </button>
+          <div class="flex flex-wrap items-center gap-2">
+            ${item.imageUrl ? `
+              <button onclick="shareImageById('${item.id}')" class="px-4 py-2.5 rounded-xl bg-slate-200 dark:bg-studio-800 hover:bg-slate-300 dark:hover:bg-studio-700 text-xs font-semibold flex items-center gap-1.5">
+                <i data-lucide="share-2" class="w-4 h-4"></i>
+                <span>Simpan / Bagikan</span>
+              </button>
+              <button onclick="downloadImageById('${item.id}')" class="px-4 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold flex items-center gap-1.5">
+                <i data-lucide="download" class="w-4 h-4"></i>
+                <span>Unduh PNG</span>
+              </button>
+            ` : ''}
+          </div>
+        </div>
+      `);
+    }
+
+    /**
+     * =========================================================================
+     * 8. MANAJEMEN PROYEK, KARAKTER CRUD & PANDUAN PENGGUNA
+     * =========================================================================
+     */
+    function selectProject(projectId) {
+      appState.activeProjectId = projectId;
+      appState.selectedEpisodeNumber = 1;
+      saveState();
+      renderApp();
+      showToast('Proyek serial berhasil dibuka!', 'success');
+    }
+
+    function openNewProjectModal() {
+      openModal(`
+        <div class="flex items-center justify-between mb-4">
+          <div class="flex items-center gap-2.5">
+            <div class="w-9 h-9 rounded-xl bg-amber-500/15 text-amber-500 flex items-center justify-center">
+              <i data-lucide="clapperboard" class="w-5 h-5"></i>
+            </div>
+            <div>
+              <h3 class="font-serif font-bold text-xl">Mulai Proyek Serial Drama Baru</h3>
+              <p class="text-xs text-slate-500 dark:text-slate-400">Masukkan judul atau ide singkat untuk memulai studio baru</p>
+            </div>
           </div>
           <button onclick="closeModal()" class="p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-studio-800 text-slate-400">
             <i data-lucide="x" class="w-5 h-5"></i>
           </button>
         </div>
-        <img src="${item.imageUrl}" alt="${escapeHtml(item.title)}" class="w-full max-h-[68vh] object-contain rounded-2xl bg-black mb-2">
-        <p class="text-[11px] text-slate-400 mb-4">Tips HP: Jika browser memblokir unduhan otomatis, tekan tombol <strong>Simpan / Bagikan</strong> atau tekan tahan pada gambar di atas lalu pilih <em>Simpan Gambar</em>.</p>
-        <div class="flex flex-wrap justify-end gap-2">
-          <button onclick="shareGalleryImage('${item.id}')" class="px-4 py-2.5 rounded-xl bg-slate-200 dark:bg-studio-800 text-xs font-bold flex items-center gap-1.5">
-            <i data-lucide="share-2" class="w-4 h-4"></i>
-            <span>Simpan / Bagikan ke HP</span>
-          </button>
-          <button onclick="downloadGalleryImage('${item.id}')" class="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold flex items-center gap-1.5">
-            <i data-lucide="download" class="w-4 h-4"></i>
-            <span>Unduh Resolusi Penuh</span>
+
+        <div class="space-y-4">
+          <div>
+            <label class="block text-xs font-semibold mb-1.5">Judul Sementara Serial Drama</label>
+            <input id="new-proj-title" type="text" placeholder="Contoh: Cahaya di Ujung Rindu" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500" />
+          </div>
+          <div>
+            <label class="block text-xs font-semibold mb-1.5">Pilih Genre Utama</label>
+            <select id="new-proj-genre" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500">
+              ${GENRE_LIST.map(g => `<option value="${escapeHtml(g.name)}">${escapeHtml(g.name)}</option>`).join('')}
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs font-semibold mb-1.5">Jumlah Episode</label>
+            <select id="new-proj-eps" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500">
+              <option value="3">3 Episode (Mini Seri)</option>
+              <option value="5" selected>5 Episode (Standar)</option>
+              <option value="10">10 Episode (Musim Penuh)</option>
+              <option value="15">15 Episode</option>
+              <option value="20">20 Episode</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="flex justify-end gap-2.5 mt-6">
+          <button onclick="closeModal()" class="px-4 py-2.5 rounded-xl bg-slate-200 dark:bg-studio-800 text-xs sm:text-sm font-semibold">Batal</button>
+          <button onclick="confirmCreateNewProject()" class="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs sm:text-sm font-bold flex items-center gap-1.5">
+            <i data-lucide="sparkles" class="w-4 h-4"></i>
+            <span>Buat & Masuk Studio</span>
           </button>
         </div>
       `);
     }
 
-    function compileFullSeriesDocument() {
-      const p = getActiveProject();
-      const s = p.settings;
-      let doc = `====================================================================\n`;
-      doc += `DRAMA STUDIO AI – PAKET PRODUKSI SERIAL DRAMA\n`;
-      doc += `====================================================================\n\n`;
-      doc += `JUDUL SERIAL   : ${s.title}\n`;
-      doc += `GENRE          : ${p.customGenre || p.genre}\n`;
-      doc += `TEMA UTAMA     : ${s.theme}\n`;
-      doc += `LATAR & ZAMAN  : ${s.settingPlace} (${s.era})\n`;
-      doc += `SUASANA        : ${s.mood}\n`;
-      doc += `TARGET PENONTON: ${s.audience}\n`;
-      doc += `FORMAT         : ${s.episodeCount} Episode (${s.episodeDuration}/episode)\n`;
-      doc += `GAYA CERITA    : ${s.narrativeStyle}\n`;
-      doc += `PESAN MORAL    : ${s.moralMessage}\n\n`;
-      doc += `SINOPSIS SERIAL:\n${s.synopsis}\n\n`;
+    function confirmCreateNewProject() {
+      const titleInput = document.getElementById('new-proj-title')?.value.trim() || 'Serial Drama Tanpa Judul';
+      const genreInput = document.getElementById('new-proj-genre')?.value || 'Drama keluarga';
+      const epsInput = parseInt(document.getElementById('new-proj-eps')?.value, 10) || 5;
 
-      doc += `--------------------------------------------------------------------\n`;
-      doc += `DAFTAR KARAKTER & REFERENSI VISUAL\n`;
-      doc += `--------------------------------------------------------------------\n`;
-      (p.characters || []).forEach((c, idx) => {
-        doc += `${idx + 1}. ${c.name} (${c.age}, ${c.gender}) — ${c.role}\n`;
-        doc += `   Sifat         : ${c.personality}\n`;
-        doc += `   Latar Belakang: ${c.background}\n`;
-        doc += `   Hubungan      : ${c.relationships}\n`;
-        doc += `   Ciri Fisik    : ${c.physicalTraits}\n`;
-        doc += `   Gaya Pakaian  : ${c.clothingStyle}\n\n`;
-      });
+      const newProj = {
+        id: 'proj_' + Date.now(),
+        updatedAt: new Date().toISOString(),
+        genre: genreInput,
+        customGenre: '',
+        settings: {
+          title: titleInput,
+          theme: '',
+          synopsis: '',
+          settingPlace: 'Indonesia',
+          era: 'Masa Kini (2026)',
+          mood: 'Emosional & Sinematik',
+          audience: 'Semua Umur / Keluarga',
+          episodeCount: epsInput,
+          episodeDuration: '45 Menit (Standar TV/Streaming)',
+          narrativeStyle: 'Alur Maju Dramatis',
+          moralMessage: ''
+        },
+        characters: [],
+        storyArc: null,
+        scripts: {},
+        gallery: []
+      };
 
-      if (p.storyArc) {
-        doc += `--------------------------------------------------------------------\n`;
-        doc += `ALUR CERITA BERSERI\n`;
-        doc += `--------------------------------------------------------------------\n`;
-        doc += `Konflik Utama   : ${p.storyArc.mainConflict}\n`;
-        doc += `Konflik Tambahan: ${p.storyArc.subConflicts}\n`;
-        doc += `Klimaks         : ${p.storyArc.climax}\n`;
-        doc += `Plot Twist      : ${p.storyArc.plotTwist}\n`;
-        doc += `Penyelesaian    : ${p.storyArc.resolution}\n\n`;
-        (p.storyArc.episodes || []).forEach(ep => {
-          doc += `Episode ${ep.episodeNumber}: ${ep.title}\nRingkasan: ${ep.summary}\nKaitan Utama: ${ep.connectionToMainArc}\nCliffhanger: ${ep.cliffhanger}\n\n`;
+      appState.projects.unshift(newProj);
+      appState.activeProjectId = newProj.id;
+      appState.selectedEpisodeNumber = 1;
+      closeModal();
+      navigateTo('setup');
+      showToast(`Proyek "${titleInput}" berhasil dibuat!`, 'success');
+    }
+
+    function openCharacterModal(charId = null) {
+      const proj = getActiveProject();
+      const existing = charId ? (proj.characters || []).find(c => c.id === charId) : null;
+
+      openModal(`
+        <div class="flex items-center justify-between mb-4">
+          <h3 class="font-serif font-bold text-xl">${existing ? 'Edit Profil Karakter' : 'Tambah Karakter Baru'}</h3>
+          <button onclick="closeModal()" class="p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-studio-800 text-slate-400">
+            <i data-lucide="x" class="w-5 h-5"></i>
+          </button>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3.5 max-h-[65vh] overflow-y-auto pr-1">
+          <div>
+            <label class="block text-xs font-semibold mb-1">Nama Karakter *</label>
+            <input id="char-name" type="text" value="${escapeHtml(existing?.name || '')}" placeholder="Contoh: Raka Pratama" class="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm" />
+          </div>
+          <div>
+            <label class="block text-xs font-semibold mb-1">Usia</label>
+            <input id="char-age" type="text" value="${escapeHtml(existing?.age || '')}" placeholder="Contoh: 28 Tahun" class="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm" />
+          </div>
+          <div>
+            <label class="block text-xs font-semibold mb-1">Jenis Kelamin</label>
+            <select id="char-gender" class="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm">
+              <option value="Laki-laki" ${existing?.gender === 'Laki-laki' ? 'selected' : ''}>Laki-laki</option>
+              <option value="Perempuan" ${existing?.gender === 'Perempuan' ? 'selected' : ''}>Perempuan</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs font-semibold mb-1">Peran dalam Cerita</label>
+            <input id="char-role" type="text" value="${escapeHtml(existing?.role || '')}" placeholder="Protagonis / Antagonis / Mentor" class="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm" />
+          </div>
+          <div class="sm:col-span-2">
+            <label class="block text-xs font-semibold mb-1">Sifat dan Kepribadian</label>
+            <textarea id="char-personality" rows="2" class="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm">${escapeHtml(existing?.personality || '')}</textarea>
+          </div>
+          <div class="sm:col-span-2">
+            <label class="block text-xs font-semibold mb-1">Latar Belakang Kehidupan</label>
+            <textarea id="char-background" rows="2" class="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm">${escapeHtml(existing?.background || '')}</textarea>
+          </div>
+          <div class="sm:col-span-2">
+            <label class="block text-xs font-semibold mb-1">Hubungan dengan Karakter Lain</label>
+            <input id="char-relationships" type="text" value="${escapeHtml(existing?.relationships || '')}" class="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm" />
+          </div>
+          <div class="sm:col-span-2">
+            <label class="block text-xs font-semibold mb-1 text-amber-500">Ciri Fisik (Kunci Konsistensi Visual AI)</label>
+            <textarea id="char-physical" rows="2" placeholder="Bentuk wajah, warna kulit, gaya rambut, postur..." class="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 border border-amber-500/40 text-sm">${escapeHtml(existing?.physicalTraits || '')}</textarea>
+          </div>
+          <div class="sm:col-span-2">
+            <label class="block text-xs font-semibold mb-1 text-amber-500">Gaya Pakaian (Kunci Konsistensi Visual AI)</label>
+            <textarea id="char-clothing" rows="2" placeholder="Pakaian khas yang dikenakan karakter di serial..." class="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 border border-amber-500/40 text-sm">${escapeHtml(existing?.clothingStyle || '')}</textarea>
+          </div>
+        </div>
+
+        <div class="flex justify-end gap-2.5 mt-5">
+          <button onclick="closeModal()" class="px-4 py-2.5 rounded-xl bg-slate-200 dark:bg-studio-800 text-xs sm:text-sm font-semibold">Batal</button>
+          <button onclick="saveCharacterForm('${existing ? existing.id : ''}')" class="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs sm:text-sm font-bold">Simpan Karakter</button>
+        </div>
+      `);
+    }
+
+    function saveCharacterForm(charId) {
+      const name = document.getElementById('char-name')?.value.trim();
+      if (!name) {
+        showToast('Nama karakter wajib diisi.', 'warning');
+        return;
+      }
+
+      const proj = getActiveProject();
+      const payload = {
+        name,
+        age: document.getElementById('char-age')?.value.trim() || '25 Tahun',
+        gender: document.getElementById('char-gender')?.value || 'Laki-laki',
+        role: document.getElementById('char-role')?.value.trim() || 'Tokoh Pendukung',
+        personality: document.getElementById('char-personality')?.value.trim() || '',
+        background: document.getElementById('char-background')?.value.trim() || '',
+        relationships: document.getElementById('char-relationships')?.value.trim() || '',
+        physicalTraits: document.getElementById('char-physical')?.value.trim() || '',
+        clothingStyle: document.getElementById('char-clothing')?.value.trim() || ''
+      };
+
+      if (charId) {
+        const idx = (proj.characters || []).findIndex(c => c.id === charId);
+        if (idx !== -1) {
+          proj.characters[idx] = { ...proj.characters[idx], ...payload };
+        }
+      } else {
+        proj.characters.push({
+          id: 'char_' + Date.now(),
+          ...payload,
+          imageUrl: ''
         });
       }
 
-      doc += `--------------------------------------------------------------------\n`;
-      doc += `NASKAH EPISODE\n`;
-      doc += `--------------------------------------------------------------------\n\n`;
-      Object.values(p.scripts || {}).forEach(sc => {
-        doc += `*** EPISODE ${sc.episodeNumber}: ${sc.title.toUpperCase()} ***\n`;
-        doc += `Ringkasan: ${sc.summary}\nAdegan Pembuka: ${sc.openingHook}\n\n`;
-        (sc.scenes || []).forEach(scene => {
-          doc += `ADEGAN ${scene.sceneNumber} - ${scene.heading}\nLokasi: ${scene.locationDesc}\nKarakter: ${(scene.charactersPresent || []).join(', ')}\nKamera: ${scene.cameraDirection}\nVisual: ${scene.visualDesc}\nMusik: ${scene.musicAmbience}\nNarasi: ${scene.narration}\n\n`;
-          (scene.dialogue || []).forEach(d => {
-            doc += `${d.character.toUpperCase()} (${d.emotion}): "${d.line}"\n`;
-          });
-          doc += `\n`;
+      saveState();
+      closeModal();
+      renderApp();
+      showToast(`Karakter "${name}" berhasil disimpan!`, 'success');
+    }
+
+    function deleteCharacter(charId) {
+      const proj = getActiveProject();
+      proj.characters = (proj.characters || []).filter(c => c.id !== charId);
+      saveState();
+      renderApp();
+      showToast('Karakter dihapus.', 'info');
+    }
+
+    function toggleDashboardGuide() {
+      appState.showDashboardGuide = !appState.showDashboardGuide;
+      renderApp();
+    }
+
+    function openUserGuideModal() {
+      const steps = [
+        {
+          step: 'Langkah 1',
+          title: 'Pilih Genre & Pengaturan Cerita',
+          desc: 'Pilih dari 15 kartu genre drama atau tulis genre sendiri. Tentukan judul, tema, latar tempat, zaman, suasana, pesan moral, serta jumlah episode (3 hingga 20 episode). Gunakan tombol "Isi Otomatis dengan AI" jika butuh inspirasi cepat.',
+          tab: 'setup',
+          btnText: 'Buka Genre & Cerita'
+        },
+        {
+          step: 'Langkah 2',
+          title: 'Buat Karakter & Kunci Visual',
+          desc: 'Klik "Buat Karakter Otomatis AI" atau tambah manual. Setiap tokoh memiliki ciri fisik, gaya pakaian, dan foto referensi AI agar wajah & busana tetap konsisten di semua episode.',
+          tab: 'characters',
+          btnText: 'Buka Studio Karakter'
+        },
+        {
+          step: 'Langkah 3',
+          title: 'Susun Alur Cerita Berseri',
+          desc: 'AI akan merangkai sinopsis lengkap, konflik utama, konflik tambahan, klimaks, plot twist, dan ringkasan Episode 1 sampai Episode terakhir yang saling terhubung.',
+          tab: 'plot',
+          btnText: 'Buka Alur Serial'
+        },
+        {
+          step: 'Langkah 4',
+          title: 'Tulis & Edit Naskah Episode',
+          desc: 'Buat naskah lengkap per episode berisi adegan pembuka, dialog beremosi, gerakan kamera, musik latar, serta cliffhanger. Anda juga dapat memutar sulih suara AI atau mengedit naskah.',
+          tab: 'script',
+          btnText: 'Buka Naskah Episode'
+        },
+        {
+          step: 'Langkah 5',
+          title: 'Buat Poster, Ilustrasi & Ekspor',
+          desc: 'Hasilkan poster utama serial, potret karakter, dan ilustrasi adegan dalam 6 pilihan gaya visual, lalu unduh hasilnya atau ekspor seluruh naskah produksi.',
+          tab: 'visuals',
+          btnText: 'Buka Studio Visual AI'
+        }
+      ];
+
+      openModal(`
+        <div class="flex items-center justify-between mb-4">
+          <div class="flex items-center gap-2.5">
+            <div class="w-10 h-10 rounded-xl bg-amber-500/15 text-amber-500 flex items-center justify-center">
+              <i data-lucide="book-open-check" class="w-5 h-5"></i>
+            </div>
+            <div>
+              <h3 class="font-serif font-bold text-xl">Petunjuk Penggunaan DRAMA STUDIO AI</h3>
+              <p class="text-xs text-slate-500 dark:text-slate-400">Ikuti 5 langkah mudah berikut untuk memproduksi serial drama Anda</p>
+            </div>
+          </div>
+          <button onclick="closeModal()" class="p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-studio-800 text-slate-400">
+            <i data-lucide="x" class="w-5 h-5"></i>
+          </button>
+        </div>
+
+        <div class="space-y-3 max-h-[65vh] overflow-y-auto pr-1">
+          ${steps.map(s => `
+            <div class="p-4 rounded-2xl bg-slate-100/80 dark:bg-studio-800/80 border border-slate-200 dark:border-slate-700/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div class="space-y-1">
+                <span class="inline-block text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md bg-amber-500/20 text-amber-600 dark:text-amber-300">${s.step}</span>
+                <h4 class="font-bold text-sm text-slate-900 dark:text-white">${s.title}</h4>
+                <p class="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">${s.desc}</p>
+              </div>
+              <button onclick="closeModal(); navigateTo('${s.tab}')" class="shrink-0 px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs transition-colors">
+                ${s.btnText}
+              </button>
+            </div>
+          `).join('')}
+        </div>
+      `);
+    }
+
+    /**
+     * =========================================================================
+     * 9. RENDER HALAMAN UTAMA (DASHBOARD)
+     * =========================================================================
+     */
+    function renderDashboardView() {
+      const proj = getActiveProject();
+      const allChars = proj.characters || [];
+      const allPosters = (proj.gallery || []).filter(g => g.category === 'Poster utama serial' || g.imageUrl);
+      const episodesList = proj.storyArc?.episodes || [];
+
+      return `
+        <div class="space-y-8 animate-fade-in">
+          <!-- Hero Banner -->
+          <section class="relative overflow-hidden rounded-3xl bg-gradient-to-br from-slate-900 via-studio-900 to-amber-950/60 border border-amber-500/25 p-6 sm:p-10 text-white shadow-2xl">
+            <div class="absolute -top-24 -right-24 w-72 h-72 rounded-full bg-amber-500/15 blur-3xl pointer-events-none"></div>
+            <div class="relative z-10 max-w-3xl space-y-4">
+              <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-300 text-xs font-semibold">
+                <i data-lucide="sparkles" class="w-3.5 h-3.5"></i>
+                <span>DRAMA STUDIO AI • STUDIO KREATIF SERIAL DRAMA</span>
+              </div>
+              <h1 class="font-serif font-extrabold text-2xl sm:text-4xl lg:text-5xl leading-tight tracking-tight">
+                Wujudkan Ide Ceritamu Menjadi Serial Drama.
+              </h1>
+              <p class="text-sm sm:text-base text-slate-300 leading-relaxed max-w-2xl">
+                Rancang konsep serial drama lengkap mulai dari pemilihan genre, karakter dengan konsistensi visual, alur cerita berseri yang saling terhubung, naskah dialog siap produksi, hingga poster sinematik dalam satu studio terpadu.
+              </p>
+              <div class="flex flex-wrap items-center gap-3 pt-2">
+                <button onclick="openNewProjectModal()" class="px-5 py-3 rounded-2xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm flex items-center gap-2 shadow-lg shadow-amber-500/25 transition-all">
+                  <i data-lucide="clapperboard" class="w-4 h-4"></i>
+                  <span>Mulai Membuat Drama</span>
+                </button>
+                <button onclick="navigateTo('setup')" class="px-5 py-3 rounded-2xl bg-white/10 hover:bg-white/20 text-white border border-white/15 font-semibold text-sm flex items-center gap-2 backdrop-blur-md transition-all">
+                  <i data-lucide="play" class="w-4 h-4 text-amber-400"></i>
+                  <span>Lanjutkan Proyek (${escapeHtml(proj.settings.title)})</span>
+                </button>
+                <button onclick="openUserGuideModal()" class="px-4 py-3 rounded-2xl bg-slate-800/80 hover:bg-slate-800 text-amber-300 border border-slate-700 font-semibold text-sm flex items-center gap-2 transition-all">
+                  <i data-lucide="help-circle" class="w-4 h-4"></i>
+                  <span>Cara Penggunaan</span>
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <!-- Langkah-Langkah Penggunaan Studio -->
+          <section class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-5 sm:p-6 shadow-sm">
+            <div class="flex items-center justify-between gap-3 mb-4">
+              <div class="flex items-center gap-2.5">
+                <div class="w-9 h-9 rounded-xl bg-amber-500/15 text-amber-500 flex items-center justify-center">
+                  <i data-lucide="compass" class="w-5 h-5"></i>
+                </div>
+                <div>
+                  <h2 class="font-serif font-bold text-lg sm:text-xl">Langkah-Langkah Membuat Serial Drama</h2>
+                  <p class="text-xs text-slate-500 dark:text-slate-400">Alur kerja studio dari ide mentah menjadi naskah & visual siap produksi</p>
+                </div>
+              </div>
+              <button onclick="toggleDashboardGuide()" class="text-xs font-semibold text-amber-500 hover:underline">
+                ${appState.showDashboardGuide ? 'Sembunyikan' : 'Tampilkan Langkah'}
+              </button>
+            </div>
+
+            ${appState.showDashboardGuide ? `
+              <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+                ${[
+                  { no: '01', title: 'Genre & Cerita', desc: 'Pilih 15 genre atau tulis sendiri, lalu atur sinopsis & jumlah episode.', tab: 'setup' },
+                  { no: '02', title: 'Buat Karakter', desc: 'Rancang tokoh beserta ciri fisik & pakaian konsisten.', tab: 'characters' },
+                  { no: '03', title: 'Alur Serial', desc: 'Susun konflik utama, plot twist, dan alur tiap episode terhubung.', tab: 'plot' },
+                  { no: '04', title: 'Naskah Episode', desc: 'Hasilkan dialog beremosi, arahan kamera, dan audio suara AI.', tab: 'script' },
+                  { no: '05', title: 'Studio Visual AI', desc: 'Buat poster serial, foto tokoh, dan ilustrasi setiap adegan.', tab: 'visuals' }
+                ].map(item => `
+                  <button onclick="navigateTo('${item.tab}')" class="text-left p-4 rounded-2xl bg-slate-50 dark:bg-studio-850 hover:border-amber-500/50 border border-slate-200 dark:border-slate-800 transition-all group">
+                    <div class="flex items-center justify-between mb-2">
+                      <span class="font-mono text-xs font-bold px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-500">LANGKAH ${item.no}</span>
+                      <i data-lucide="arrow-up-right" class="w-4 h-4 text-slate-400 group-hover:text-amber-500 transition-colors"></i>
+                    </div>
+                    <h3 class="font-bold text-sm mb-1 group-hover:text-amber-500 transition-colors">${item.title}</h3>
+                    <p class="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">${item.desc}</p>
+                  </button>
+                `).join('')}
+              </div>
+            ` : ''}
+          </section>
+
+          <!-- Drama yang Pernah Dibuat -->
+          <section class="space-y-4">
+            <div class="flex items-center justify-between">
+              <h2 class="font-serif font-bold text-xl flex items-center gap-2">
+                <i data-lucide="film" class="w-5 h-5 text-amber-500"></i>
+                <span>Drama yang Pernah Dibuat</span>
+              </h2>
+              <button onclick="openNewProjectModal()" class="text-xs font-semibold text-amber-500 hover:underline">+ Tambah Proyek</button>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              ${appState.projects.map(p => {
+                const isSelected = p.id === proj.id;
+                return `
+                  <div class="rounded-3xl bg-white dark:bg-studio-900 border ${isSelected ? 'border-amber-500/60 ring-1 ring-amber-500/30' : 'border-slate-200 dark:border-slate-800'} p-5 flex flex-col justify-between gap-4 shadow-sm">
+                    <div class="space-y-2">
+                      <div class="flex items-center justify-between gap-2">
+                        <span class="text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-amber-500/15 text-amber-600 dark:text-amber-300">
+                          ${escapeHtml(p.customGenre || p.genre)}
+                        </span>
+                        <span class="text-[11px] text-slate-400">${p.settings.episodeCount} Episode</span>
+                      </div>
+                      <h3 class="font-serif font-bold text-lg text-slate-900 dark:text-white">${escapeHtml(p.settings.title)}</h3>
+                      <p class="text-xs text-slate-600 dark:text-slate-400 line-clamp-3 leading-relaxed">
+                        ${escapeHtml(p.settings.synopsis || 'Belum ada sinopsis cerita.')}
+                      </p>
+                    </div>
+                    <div class="flex items-center justify-between pt-3 border-t border-slate-100 dark:border-slate-800">
+                      <span class="text-[11px] text-slate-400">${(p.characters || []).length} Karakter • ${Object.keys(p.scripts || {}).length} Naskah</span>
+                      <button onclick="selectProject('${p.id}'); navigateTo('setup');" class="px-3.5 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs transition-colors">
+                        Lanjutkan Proyek
+                      </button>
+                    </div>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+          </section>
+
+          <!-- Grid 3 Kolom: Koleksi Karakter, Koleksi Poster, Episode Terbaru -->
+          <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <!-- Koleksi Karakter -->
+            <section class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+              <div class="flex items-center justify-between">
+                <h2 class="font-serif font-bold text-lg flex items-center gap-2">
+                  <i data-lucide="users" class="w-4 h-4 text-amber-500"></i>
+                  <span>Koleksi Karakter</span>
+                </h2>
+                <button onclick="navigateTo('characters')" class="text-xs font-semibold text-amber-500 hover:underline">Kelola</button>
+              </div>
+              <div class="space-y-3">
+                ${allChars.length === 0
+                  ? `<p class="text-xs text-slate-500 py-4 text-center">Belum ada karakter pada proyek ini.</p>`
+                  : allChars.slice(0, 4).map(c => `
+                    <div onclick="navigateTo('characters')" class="flex items-center gap-3 p-2.5 rounded-2xl bg-slate-50 dark:bg-studio-850 hover:border-amber-500/40 border border-transparent cursor-pointer transition-all">
+                      ${c.imageUrl
+                        ? `<img src="${c.imageUrl}" alt="${escapeHtml(c.name)}" class="w-12 h-12 rounded-xl object-cover shrink-0 border border-amber-500/30" />`
+                        : `<div class="w-12 h-12 rounded-xl bg-gradient-to-br from-amber-500/20 to-orange-600/20 text-amber-500 font-serif font-bold text-lg flex items-center justify-center shrink-0">${escapeHtml(c.name.charAt(0))}</div>`
+                      }
+                      <div class="min-w-0 flex-1">
+                        <h4 class="font-bold text-sm truncate">${escapeHtml(c.name)}</h4>
+                        <p class="text-[11px] text-amber-500 font-medium truncate">${escapeHtml(c.role)} • ${escapeHtml(c.age)}</p>
+                        <p class="text-[11px] text-slate-500 dark:text-slate-400 truncate">${escapeHtml(c.personality)}</p>
+                      </div>
+                    </div>
+                  `).join('')
+                }
+              </div>
+            </section>
+
+            <!-- Koleksi Poster -->
+            <section class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+              <div class="flex items-center justify-between">
+                <h2 class="font-serif font-bold text-lg flex items-center gap-2">
+                  <i data-lucide="image" class="w-4 h-4 text-amber-500"></i>
+                  <span>Koleksi Poster</span>
+                </h2>
+                <button onclick="navigateTo('visuals')" class="text-xs font-semibold text-amber-500 hover:underline">Studio Visual</button>
+              </div>
+              <div class="grid grid-cols-2 gap-3">
+                ${allPosters.slice(0, 4).map(item => `
+                  <div onclick="${item.imageUrl ? `openImagePreviewModal('${item.id}')` : `navigateTo('visuals')`}" class="group relative rounded-2xl overflow-hidden aspect-[3/4] bg-gradient-to-br from-amber-900/50 via-studio-850 to-slate-950 border border-slate-700/60 cursor-pointer">
+                    ${item.imageUrl
+                      ? `<img src="${item.imageUrl}" alt="${escapeHtml(item.title)}" class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" />`
+                      : `<div class="w-full h-full p-3 flex flex-col justify-between">
+                          <span class="text-[10px] uppercase tracking-wider text-amber-400 font-bold">Konsep Poster</span>
+                          <div>
+                            <p class="font-serif font-bold text-xs text-white leading-snug mb-1">${escapeHtml(proj.settings.title)}</p>
+                            <span class="inline-block text-[10px] px-2 py-0.5 rounded bg-amber-500 text-slate-950 font-bold">Render AI</span>
+                          </div>
+                        </div>`
+                    }
+                  </div>
+                `).join('')}
+              </div>
+            </section>
+
+            <!-- Episode Terbaru -->
+            <section class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-5 space-y-4">
+              <div class="flex items-center justify-between">
+                <h2 class="font-serif font-bold text-lg flex items-center gap-2">
+                  <i data-lucide="list-video" class="w-4 h-4 text-amber-500"></i>
+                  <span>Episode Terbaru</span>
+                </h2>
+                <button onclick="navigateTo('script')" class="text-xs font-semibold text-amber-500 hover:underline">Buka Naskah</button>
+              </div>
+              <div class="space-y-2.5">
+                ${episodesList.length === 0
+                  ? `<p class="text-xs text-slate-500 py-4 text-center">Belum ada daftar episode. Susun alur serial terlebih dahulu.</p>`
+                  : episodesList.slice(0, 5).map(ep => {
+                    const hasScript = Boolean(proj.scripts?.[ep.episodeNumber]);
+                    return `
+                      <div onclick="appState.selectedEpisodeNumber = ${ep.episodeNumber}; navigateTo('script');" class="p-3 rounded-2xl bg-slate-50 dark:bg-studio-850 hover:border-amber-500/40 border border-transparent cursor-pointer transition-all">
+                        <div class="flex items-center justify-between gap-2 mb-1">
+                          <span class="text-[11px] font-bold text-amber-500">EPISODE ${ep.episodeNumber}</span>
+                          <span class="text-[10px] px-2 py-0.5 rounded-full ${hasScript ? 'bg-emerald-500/15 text-emerald-400' : 'bg-slate-200 dark:bg-studio-800 text-slate-400'}">
+                            ${hasScript ? 'Naskah Siap' : 'Garis Besar'}
+                          </span>
+                        </div>
+                        <h4 class="font-bold text-xs sm:text-sm truncate">${escapeHtml(ep.title)}</h4>
+                        <p class="text-[11px] text-slate-500 dark:text-slate-400 line-clamp-1 mt-0.5">${escapeHtml(ep.summary)}</p>
+                      </div>
+                    `;
+                  }).join('')
+                }
+              </div>
+            </section>
+          </div>
+        </div>
+      `;
+    }
+
+    /**
+     * =========================================================================
+     * 10. RENDER PILIHAN GENRE & PENGATURAN CERITA
+     * =========================================================================
+     */
+    function selectGenre(genreName) {
+      const proj = getActiveProject();
+      proj.genre = genreName;
+      proj.customGenre = '';
+      saveState();
+      renderApp();
+    }
+
+    function updateCustomGenre(val) {
+      const proj = getActiveProject();
+      proj.customGenre = val;
+      saveState();
+    }
+
+    function updateSettingField(field, value) {
+      const proj = getActiveProject();
+      if (field === 'episodeCount') {
+        proj.settings[field] = Math.max(1, Math.min(50, parseInt(value, 10) || 5));
+      } else {
+        proj.settings[field] = value;
+      }
+      saveState();
+      if (field === 'title') {
+        updateHeaderAndNav();
+      }
+    }
+
+    function renderSetupView() {
+      const proj = getActiveProject();
+      const s = proj.settings;
+      const presetCounts = [3, 5, 10, 15, 20];
+      const isCustomCount = !presetCounts.includes(Number(s.episodeCount));
+
+      return `
+        <div class="space-y-8 animate-fade-in">
+          <!-- Header Section -->
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div>
+              <span class="text-xs font-bold uppercase tracking-wider text-amber-500">Tahap 1 • Fondasi Kreatif</span>
+              <h1 class="font-serif font-bold text-2xl sm:text-3xl">Pilihan Genre & Pengaturan Cerita</h1>
+              <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mt-1">Pilih nuansa drama yang Anda inginkan, lalu lengkapi parameter produksi serial.</p>
+            </div>
+            <button onclick="aiAutoFillStorySettings()" class="px-4 py-3 rounded-2xl bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950 font-bold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-amber-500/20">
+              <i data-lucide="sparkles" class="w-4 h-4"></i>
+              <span>Isi Otomatis Konsep Cerita AI</span>
+            </button>
+          </div>
+
+          <!-- B. PILIHAN GENRE DRAMA (15 Kartu Bergambar + Genre Sendiri) -->
+          <section class="space-y-4">
+            <h2 class="font-serif font-bold text-lg flex items-center gap-2">
+              <i data-lucide="layers" class="w-5 h-5 text-amber-500"></i>
+              <span>Pilih Genre Drama</span>
+            </h2>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
+              ${GENRE_LIST.map(g => {
+                const isSelected = !proj.customGenre && proj.genre === g.name;
+                return `
+                  <button onclick="selectGenre('${escapeHtml(g.name)}')"
+                    class="text-left rounded-2xl overflow-hidden border transition-all flex flex-col justify-between ${
+                      isSelected
+                        ? 'border-amber-400 ring-2 ring-amber-500/40 scale-[1.01]'
+                        : 'border-slate-200 dark:border-slate-800 hover:border-amber-500/40'
+                    } bg-white dark:bg-studio-900">
+                    <div class="h-16 bg-gradient-to-br ${g.gradient} p-3 flex items-center justify-between text-white">
+                      <div class="w-8 h-8 rounded-xl bg-white/15 backdrop-blur-sm flex items-center justify-center">
+                        <i data-lucide="${g.icon}" class="w-4 h-4"></i>
+                      </div>
+                      ${isSelected ? `<span class="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-400 text-slate-950">Dipilih</span>` : ''}
+                    </div>
+                    <div class="p-3.5 flex-1">
+                      <h3 class="font-bold text-xs sm:text-sm text-slate-900 dark:text-white mb-1">${escapeHtml(g.name)}</h3>
+                      <p class="text-[11px] text-slate-500 dark:text-slate-400 leading-snug">${escapeHtml(g.desc)}</p>
+                    </div>
+                  </button>
+                `;
+              }).join('')}
+            </div>
+
+            <!-- Buat Genre Sendiri -->
+            <div class="p-4 rounded-2xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center gap-3">
+              <div class="flex items-center gap-2 shrink-0">
+                <i data-lucide="pen-tool" class="w-4 h-4 text-amber-500"></i>
+                <span class="text-xs sm:text-sm font-bold">Buat Genre Sendiri:</span>
+              </div>
+              <input type="text" value="${escapeHtml(proj.customGenre)}" oninput="updateCustomGenre(this.value)"
+                placeholder="Tulis kombinasi genre unik Anda, misal: Drama Misteri Kuliner Nusantara..."
+                class="flex-1 px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-xs sm:text-sm focus:outline-none focus:border-amber-500" />
+            </div>
+          </section>
+
+          <!-- C. PENGATURAN CERITA -->
+          <section class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-5 sm:p-7 space-y-5">
+            <h2 class="font-serif font-bold text-lg flex items-center gap-2">
+              <i data-lucide="sliders" class="w-5 h-5 text-amber-500"></i>
+              <span>Pengaturan Detail Cerita</span>
+            </h2>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label class="block text-xs font-semibold mb-1.5">Judul Drama</label>
+                <input type="text" value="${escapeHtml(s.title)}" oninput="updateSettingField('title', this.value)" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500" />
+              </div>
+              <div>
+                <label class="block text-xs font-semibold mb-1.5">Tema Utama</label>
+                <input type="text" value="${escapeHtml(s.theme)}" oninput="updateSettingField('theme', this.value)" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500" />
+              </div>
+              <div class="md:col-span-2">
+                <label class="block text-xs font-semibold mb-1.5">Sinopsis Cerita</label>
+                <textarea rows="3" oninput="updateSettingField('synopsis', this.value)" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500">${escapeHtml(s.synopsis)}</textarea>
+              </div>
+              <div>
+                <label class="block text-xs font-semibold mb-1.5">Latar Tempat</label>
+                <input type="text" value="${escapeHtml(s.settingPlace)}" oninput="updateSettingField('settingPlace', this.value)" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500" />
+              </div>
+              <div>
+                <label class="block text-xs font-semibold mb-1.5">Zaman Cerita</label>
+                <input type="text" value="${escapeHtml(s.era)}" oninput="updateSettingField('era', this.value)" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500" />
+              </div>
+              <div>
+                <label class="block text-xs font-semibold mb-1.5">Suasana Cerita</label>
+                <input type="text" value="${escapeHtml(s.mood)}" oninput="updateSettingField('mood', this.value)" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500" />
+              </div>
+              <div>
+                <label class="block text-xs font-semibold mb-1.5">Target Penonton</label>
+                <select onchange="updateSettingField('audience', this.value)" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500">
+                  ${['Semua Umur / Keluarga', 'Remaja (13+)', 'Dewasa Muda (17+)', 'Dewasa (21+)'].map(opt =>
+                    `<option value="${opt}" ${s.audience === opt ? 'selected' : ''}>${opt}</option>`
+                  ).join('')}
+                </select>
+              </div>
+
+              <!-- Pilihan Jumlah Episode: 3, 5, 10, 15, 20, atau Custom -->
+              <div>
+                <label class="block text-xs font-semibold mb-1.5">Jumlah Episode</label>
+                <div class="flex flex-wrap items-center gap-2">
+                  ${presetCounts.map(cnt => `
+                    <button type="button" onclick="updateSettingField('episodeCount', ${cnt}); renderApp();"
+                      class="px-3 py-2 rounded-xl text-xs font-bold border transition-all ${
+                        Number(s.episodeCount) === cnt
+                          ? 'bg-amber-500 text-slate-950 border-amber-500'
+                          : 'bg-slate-100 dark:bg-studio-800 border-slate-200 dark:border-slate-700'
+                      }">
+                      ${cnt} Ep
+                    </button>
+                  `).join('')}
+                  <div class="flex items-center gap-1.5">
+                    <span class="text-xs text-slate-400">Custom:</span>
+                    <input type="number" min="1" max="50" value="${s.episodeCount}" onchange="updateSettingField('episodeCount', this.value); renderApp();"
+                      class="w-16 px-2.5 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 border ${isCustomCount ? 'border-amber-500' : 'border-slate-200 dark:border-slate-700'} text-xs font-bold text-center" />
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <label class="block text-xs font-semibold mb-1.5">Durasi Setiap Episode</label>
+                <select onchange="updateSettingField('episodeDuration', this.value)" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500">
+                  ${['3–5 Menit (Drama Vertikal / Web Short)', '15 Menit (Web Series)', '30 Menit (Sitkom / Drama Pendek)', '45 Menit (Standar TV/Streaming)', '60 Menit (Drama Premium)'].map(opt =>
+                    `<option value="${opt}" ${s.episodeDuration === opt ? 'selected' : ''}>${opt}</option>`
+                  ).join('')}
+                </select>
+              </div>
+
+              <div>
+                <label class="block text-xs font-semibold mb-1.5">Gaya Penceritaan</label>
+                <input type="text" value="${escapeHtml(s.narrativeStyle)}" oninput="updateSettingField('narrativeStyle', this.value)" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500" />
+              </div>
+              <div>
+                <label class="block text-xs font-semibold mb-1.5">Pesan Moral</label>
+                <input type="text" value="${escapeHtml(s.moralMessage)}" oninput="updateSettingField('moralMessage', this.value)" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-sm focus:outline-none focus:border-amber-500" />
+              </div>
+            </div>
+
+            <div class="pt-3 flex justify-end">
+              <button onclick="navigateTo('characters')" class="px-5 py-3 rounded-2xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm flex items-center gap-2">
+                <span>Lanjut ke Pembuatan Karakter</span>
+                <i data-lucide="arrow-right" class="w-4 h-4"></i>
+              </button>
+            </div>
+          </section>
+        </div>
+      `;
+    }
+
+    /**
+     * =========================================================================
+     * 11. RENDER PEMBUATAN KARAKTER & KONSISTENSI VISUAL
+     * =========================================================================
+     */
+    function renderCharactersView() {
+      const proj = getActiveProject();
+      const chars = proj.characters || [];
+
+      return `
+        <div class="space-y-6 animate-fade-in">
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div>
+              <span class="text-xs font-bold uppercase tracking-wider text-amber-500">Tahap 2 • Pemeran & Konsistensi Wajah</span>
+              <h1 class="font-serif font-bold text-2xl sm:text-3xl">Pembuatan Karakter Serial</h1>
+              <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mt-1">Setiap karakter memiliki ciri fisik, gaya pakaian, dan foto referensi yang dikunci konsisten di seluruh episode.</p>
+            </div>
+            <div class="flex flex-wrap items-center gap-2.5">
+              <button onclick="openCharacterModal()" class="px-4 py-2.5 rounded-2xl bg-slate-200 dark:bg-studio-800 hover:bg-slate-300 dark:hover:bg-studio-700 text-xs sm:text-sm font-bold flex items-center gap-1.5">
+                <i data-lucide="user-plus" class="w-4 h-4"></i>
+                <span>Tambah Karakter</span>
+              </button>
+              <button onclick="aiGenerateCharacters()" class="px-4 py-2.5 rounded-2xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs sm:text-sm font-bold flex items-center gap-1.5 shadow-lg shadow-amber-500/20">
+                <i data-lucide="sparkles" class="w-4 h-4"></i>
+                <span>Buat Karakter Otomatis AI</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Banner Konsistensi Karakter -->
+          <div class="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-start gap-3 text-xs sm:text-sm">
+            <i data-lucide="shield-check" class="w-5 h-5 text-amber-500 shrink-0 mt-0.5"></i>
+            <div>
+              <span class="font-bold text-amber-600 dark:text-amber-300">Sistem Konsistensi Visual Aktif:</span>
+              <span class="text-slate-700 dark:text-slate-300"> Klik <strong>"Buat Foto Referensi AI"</strong> pada setiap karakter. Wajah, ciri fisik, dan gaya pakaian karakter akan otomatis dijadikan acuan visual saat membuat ilustrasi adegan di semua episode.</span>
+            </div>
+          </div>
+
+          ${chars.length === 0 ? `
+            <div class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-10 text-center space-y-3">
+              <i data-lucide="users" class="w-10 h-10 text-amber-500 mx-auto"></i>
+              <h3 class="font-serif font-bold text-xl">Belum Ada Karakter</h3>
+              <p class="text-xs sm:text-sm text-slate-500 max-w-md mx-auto">Klik tombol "Buat Karakter Otomatis AI" agar AI merancang jajaran pemeran yang sesuai dengan cerita Anda.</p>
+            </div>
+          ` : `
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+              ${chars.map(c => `
+                <div class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 overflow-hidden flex flex-col justify-between shadow-sm">
+                  <div>
+                    <!-- Header Foto / Referensi Karakter -->
+                    <div class="relative aspect-[4/3] bg-gradient-to-br from-slate-800 to-studio-950 flex items-center justify-center overflow-hidden">
+                      ${c.imageUrl
+                        ? `<img src="${c.imageUrl}" alt="${escapeHtml(c.name)}" class="w-full h-full object-cover" />`
+                        : `<div class="text-center p-4">
+                            <div class="w-16 h-16 rounded-2xl bg-amber-500/20 text-amber-400 font-serif font-bold text-3xl flex items-center justify-center mx-auto mb-2">${escapeHtml(c.name.charAt(0))}</div>
+                            <span class="text-[11px] text-slate-400">Belum ada foto referensi AI</span>
+                          </div>`
+                      }
+                      <div class="absolute top-3 left-3 flex items-center gap-1.5">
+                        <span class="text-[10px] font-bold px-2.5 py-1 rounded-full bg-slate-950/80 text-amber-300 backdrop-blur-md border border-amber-500/30">
+                          ${escapeHtml(c.role)}
+                        </span>
+                      </div>
+                      <div class="absolute top-3 right-3 flex items-center gap-1.5">
+                        <button onclick="openCharacterModal('${c.id}')" title="Edit Karakter" class="p-2 rounded-xl bg-slate-950/80 hover:bg-slate-900 text-white backdrop-blur-md">
+                          <i data-lucide="pencil" class="w-3.5 h-3.5"></i>
+                        </button>
+                        <button onclick="deleteCharacter('${c.id}')" title="Hapus Karakter" class="p-2 rounded-xl bg-rose-950/80 hover:bg-rose-900 text-rose-200 backdrop-blur-md">
+                          <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+                        </button>
+                      </div>
+                    </div>
+
+                    <!-- Detail Profil Karakter -->
+                    <div class="p-5 space-y-3">
+                      <div>
+                        <h3 class="font-serif font-bold text-xl">${escapeHtml(c.name)}</h3>
+                        <p class="text-xs text-slate-500 dark:text-slate-400">${escapeHtml(c.age)} • ${escapeHtml(c.gender)}</p>
+                      </div>
+
+                      <div class="space-y-2 text-xs">
+                        <div>
+                          <span class="font-bold text-slate-700 dark:text-slate-200">Sifat & Kepribadian:</span>
+                          <p class="text-slate-600 dark:text-slate-400">${escapeHtml(c.personality)}</p>
+                        </div>
+                        <div>
+                          <span class="font-bold text-slate-700 dark:text-slate-200">Latar Belakang:</span>
+                          <p class="text-slate-600 dark:text-slate-400">${escapeHtml(c.background)}</p>
+                        </div>
+                        <div>
+                          <span class="font-bold text-slate-700 dark:text-slate-200">Hubungan Tokoh:</span>
+                          <p class="text-slate-600 dark:text-slate-400">${escapeHtml(c.relationships)}</p>
+                        </div>
+                        <div class="p-2.5 rounded-xl bg-amber-500/5 border border-amber-500/20 space-y-1">
+                          <p><span class="font-bold text-amber-500">Ciri Fisik:</span> <span class="text-slate-600 dark:text-slate-300">${escapeHtml(c.physicalTraits)}</span></p>
+                          <p><span class="font-bold text-amber-500">Gaya Pakaian:</span> <span class="text-slate-600 dark:text-slate-300">${escapeHtml(c.clothingStyle)}</span></p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="p-4 pt-0">
+                    <button onclick="aiGenerateSingleCharacterPortrait('${c.id}')" class="w-full py-2.5 px-3 rounded-xl bg-amber-500/15 hover:bg-amber-500 hover:text-slate-950 text-amber-600 dark:text-amber-300 border border-amber-500/30 font-bold text-xs flex items-center justify-center gap-1.5 transition-all">
+                      <i data-lucide="camera" class="w-3.5 h-3.5"></i>
+                      <span>${c.imageUrl ? 'Perbarui Foto Referensi AI' : 'Buat Foto Referensi AI'}</span>
+                    </button>
+                  </div>
+                </div>
+              `).join('')}
+            </div>
+          `}
+
+          <div class="flex justify-end pt-2">
+            <button onclick="navigateTo('plot')" class="px-5 py-3 rounded-2xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm flex items-center gap-2">
+              <span>Lanjut ke Generator Alur Cerita</span>
+              <i data-lucide="arrow-right" class="w-4 h-4"></i>
+            </button>
+          </div>
+        </div>
+      `;
+    }
+
+    /**
+     * =========================================================================
+     * 12. RENDER GENERATOR ALUR CERITA BERSERI
+     * =========================================================================
+     */
+    function renderPlotView() {
+      const proj = getActiveProject();
+      const arc = proj.storyArc;
+
+      return `
+        <div class="space-y-6 animate-fade-in">
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div>
+              <span class="text-xs font-bold uppercase tracking-wider text-amber-500">Tahap 3 • Struktur Dramatik Berseri</span>
+              <h1 class="font-serif font-bold text-2xl sm:text-3xl">Generator Alur Cerita Serial</h1>
+              <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mt-1">Alur cerita saling terhubung erat dari Episode 1 hingga Episode ${proj.settings.episodeCount}.</p>
+            </div>
+            <button onclick="aiGenerateStoryArc()" class="px-4 py-3 rounded-2xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-amber-500/20">
+              <i data-lucide="sparkles" class="w-4 h-4"></i>
+              <span>Buat Alur Cerita Lengkap AI (${proj.settings.episodeCount} Ep)</span>
+            </button>
+          </div>
+
+          ${!arc ? `
+            <div class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-10 text-center space-y-3">
+              <i data-lucide="git-branch" class="w-10 h-10 text-amber-500 mx-auto"></i>
+              <h3 class="font-serif font-bold text-xl">Alur Serial Belum Disusun</h3>
+              <p class="text-xs sm:text-sm text-slate-500 max-w-md mx-auto">Klik tombol di atas agar AI menyusun konflik utama, klimaks, plot twist, dan rincian alur tiap episode.</p>
+            </div>
+          ` : `
+            <!-- Struktur Inti Serial -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div class="md:col-span-2 rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-5 space-y-2">
+                <span class="text-xs font-bold text-amber-500 uppercase tracking-wider">Ide Cerita & Sinopsis Lengkap</span>
+                <p class="font-semibold text-sm text-slate-900 dark:text-white">${escapeHtml(arc.storyIdea)}</p>
+                <p class="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">${escapeHtml(arc.fullSynopsis)}</p>
+              </div>
+
+              ${[
+                { label: 'Konflik Utama', val: arc.mainConflict, icon: 'zap' },
+                { label: 'Konflik Tambahan (Subplot)', val: arc.subConflicts, icon: 'layers' },
+                { label: 'Klimaks Puncak', val: arc.climax, icon: 'flame' },
+                { label: 'Plot Twist Mengejutkan', val: arc.plotTwist, icon: 'shuffle' },
+                { label: 'Penyelesaian Cerita', val: arc.resolution, icon: 'check-circle' },
+                { label: 'Dinamika & Hubungan Antar Tokoh', val: arc.characterDynamics, icon: 'users' }
+              ].map(box => `
+                <div class="rounded-2xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-4 space-y-1.5">
+                  <div class="flex items-center gap-2 text-amber-500 font-bold text-xs uppercase tracking-wider">
+                    <i data-lucide="${box.icon}" class="w-4 h-4"></i>
+                    <span>${box.label}</span>
+                  </div>
+                  <p class="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">${escapeHtml(box.val)}</p>
+                </div>
+              `).join('')}
+            </div>
+
+            <!-- Timeline Alur Tiap Episode -->
+            <div class="space-y-3 pt-2">
+              <h2 class="font-serif font-bold text-xl flex items-center gap-2">
+                <i data-lucide="list-ordered" class="w-5 h-5 text-amber-500"></i>
+                <span>Alur Cerita Setiap Episode (Saling Terhubung)</span>
+              </h2>
+              <div class="space-y-3">
+                ${(arc.episodes || []).map(ep => {
+                  const hasScript = Boolean(proj.scripts?.[ep.episodeNumber]);
+                  return `
+                    <div class="rounded-2xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-4 sm:p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                      <div class="space-y-1.5 flex-1">
+                        <div class="flex flex-wrap items-center gap-2">
+                          <span class="px-2.5 py-0.5 rounded-lg bg-amber-500 text-slate-950 font-bold text-xs">Episode ${ep.episodeNumber}</span>
+                          <h3 class="font-serif font-bold text-base sm:text-lg">${escapeHtml(ep.title)}</h3>
+                        </div>
+                        <p class="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">${escapeHtml(ep.summary)}</p>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1 text-[11px]">
+                          <div class="p-2 rounded-xl bg-slate-50 dark:bg-studio-850 text-slate-600 dark:text-slate-400">
+                            <span class="font-bold text-amber-500">Benang Merah Utama:</span> ${escapeHtml(ep.connectionToMainArc)}
+                          </div>
+                          <div class="p-2 rounded-xl bg-slate-50 dark:bg-studio-850 text-slate-600 dark:text-slate-400">
+                            <span class="font-bold text-rose-400">Cliffhanger Akhir:</span> ${escapeHtml(ep.cliffhanger)}
+                          </div>
+                        </div>
+                      </div>
+                      <div class="shrink-0">
+                        <button onclick="appState.selectedEpisodeNumber = ${ep.episodeNumber}; navigateTo('script'); ${hasScript ? '' : `aiGenerateEpisodeScript(${ep.episodeNumber});`}"
+                          class="w-full lg:w-auto px-4 py-2.5 rounded-xl ${hasScript ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30' : 'bg-amber-500 text-slate-950 font-bold'} text-xs font-semibold flex items-center justify-center gap-1.5">
+                          <i data-lucide="${hasScript ? 'file-check' : 'pen-tool'}" class="w-4 h-4"></i>
+                          <span>${hasScript ? 'Buka Naskah Episode' : 'Buat Naskah Episode'}</span>
+                        </button>
+                      </div>
+                    </div>
+                  `;
+                }).join('')}
+              </div>
+            </div>
+          `}
+        </div>
+      `;
+    }
+
+    /**
+     * =========================================================================
+     * 13. RENDER GENERATOR NASKAH EPISODE + EDIT + AUDIO AI
+     * =========================================================================
+     */
+    function selectEpisodeTab(epNum) {
+      appState.selectedEpisodeNumber = epNum;
+      appState.isEditingScript = false;
+      if (appState.audioBlobUrl) {
+        URL.revokeObjectURL(appState.audioBlobUrl);
+        appState.audioBlobUrl = null;
+      }
+      renderApp();
+    }
+
+    function toggleEditScriptMode() {
+      appState.isEditingScript = !appState.isEditingScript;
+      renderApp();
+    }
+
+    function saveManualScriptEdits(epNum) {
+      const proj = getActiveProject();
+      const script = proj.scripts?.[epNum];
+      if (!script) return;
+
+      script.title = document.getElementById('edit-ep-title')?.value || script.title;
+      script.summary = document.getElementById('edit-ep-summary')?.value || script.summary;
+      script.openingHook = document.getElementById('edit-ep-opening')?.value || script.openingHook;
+      script.closingCliffhanger = document.getElementById('edit-ep-closing')?.value || script.closingCliffhanger;
+
+      (script.scenes || []).forEach((sc, idx) => {
+        const headingEl = document.getElementById(`edit-sc-heading-${idx}`);
+        const locEl = document.getElementById(`edit-sc-loc-${idx}`);
+        const narEl = document.getElementById(`edit-sc-nar-${idx}`);
+        const camEl = document.getElementById(`edit-sc-cam-${idx}`);
+        const visEl = document.getElementById(`edit-sc-vis-${idx}`);
+        const musEl = document.getElementById(`edit-sc-mus-${idx}`);
+
+        if (headingEl) sc.heading = headingEl.value;
+        if (locEl) sc.locationDesc = locEl.value;
+        if (narEl) sc.narration = narEl.value;
+        if (camEl) sc.cameraDirection = camEl.value;
+        if (visEl) sc.visualDesc = visEl.value;
+        if (musEl) sc.musicAmbience = musEl.value;
+
+        (sc.dialogue || []).forEach((dlg, dIdx) => {
+          const emoEl = document.getElementById(`edit-dlg-emo-${idx}-${dIdx}`);
+          const lineEl = document.getElementById(`edit-dlg-line-${idx}-${dIdx}`);
+          if (emoEl) dlg.emotion = emoEl.value;
+          if (lineEl) dlg.line = lineEl.value;
         });
-        doc += `Adegan Penutup: ${sc.closingCliffhanger}\n\n====================================================================\n\n`;
+      });
+
+      appState.isEditingScript = false;
+      saveState();
+      renderApp();
+      showToast(`Perubahan naskah Episode ${epNum} berhasil disimpan!`, 'success');
+    }
+
+    function goToNextEpisode(currentEp) {
+      const proj = getActiveProject();
+      const totalEps = Math.max(1, parseInt(proj.settings.episodeCount, 10) || 5);
+      if (currentEp < totalEps) {
+        selectEpisodeTab(currentEp + 1);
+      } else {
+        showToast('Anda sudah berada di episode terakhir serial ini!', 'info');
+      }
+    }
+
+    function renderScriptView() {
+      const proj = getActiveProject();
+      const totalEps = Math.max(1, parseInt(proj.settings.episodeCount, 10) || 5);
+      const epNum = Math.min(totalEps, Math.max(1, appState.selectedEpisodeNumber || 1));
+      appState.selectedEpisodeNumber = epNum;
+
+      const script = proj.scripts?.[epNum];
+      const epOutline = (proj.storyArc?.episodes || []).find(e => e.episodeNumber === epNum);
+
+      return `
+        <div class="space-y-6 animate-fade-in">
+          <!-- Episode Selector Pills -->
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <span class="text-xs font-bold uppercase tracking-wider text-amber-500">Tahap 4 • Ruang Penulis Skenario</span>
+              <h1 class="font-serif font-bold text-2xl sm:text-3xl">Generator Naskah Episode</h1>
+            </div>
+            <div class="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-1">
+              ${Array.from({ length: totalEps }, (_, i) => i + 1).map(n => {
+                const isCurr = n === epNum;
+                const done = Boolean(proj.scripts?.[n]);
+                return `
+                  <button onclick="selectEpisodeTab(${n})"
+                    class="px-3.5 py-2 rounded-xl text-xs font-bold whitespace-nowrap flex items-center gap-1.5 border transition-all ${
+                      isCurr
+                        ? 'bg-amber-500 text-slate-950 border-amber-500'
+                        : 'bg-white dark:bg-studio-900 border-slate-200 dark:border-slate-800 hover:border-amber-500/40'
+                    }">
+                    <span>Ep ${n}</span>
+                    ${done ? `<span class="w-1.5 h-1.5 rounded-full ${isCurr ? 'bg-slate-950' : 'bg-emerald-400'}"></span>` : ''}
+                  </button>
+                `;
+              }).join('')}
+            </div>
+          </div>
+
+          <!-- Action Toolbar Naskah -->
+          <div class="p-4 rounded-2xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 flex flex-wrap items-center gap-2">
+            <button onclick="aiGenerateEpisodeScript(${epNum})" class="px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs flex items-center gap-1.5">
+              <i data-lucide="sparkles" class="w-3.5 h-3.5"></i>
+              <span>Buat Episode</span>
+            </button>
+            <button onclick="aiModifyEpisodeScript(${epNum}, 'dialog')" class="px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 hover:bg-slate-200 dark:hover:bg-studio-700 text-xs font-semibold flex items-center gap-1.5">
+              <i data-lucide="message-square-refresh" class="w-3.5 h-3.5 text-amber-500"></i>
+              <span>Buat Ulang Dialog</span>
+            </button>
+            <button onclick="aiModifyEpisodeScript(${epNum}, 'extend')" class="px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 hover:bg-slate-200 dark:hover:bg-studio-700 text-xs font-semibold flex items-center gap-1.5">
+              <i data-lucide="plus-circle" class="w-3.5 h-3.5 text-amber-500"></i>
+              <span>Perpanjang Cerita</span>
+            </button>
+            <button onclick="aiModifyEpisodeScript(${epNum}, 'conflict')" class="px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 hover:bg-slate-200 dark:hover:bg-studio-700 text-xs font-semibold flex items-center gap-1.5">
+              <i data-lucide="zap" class="w-3.5 h-3.5 text-amber-500"></i>
+              <span>Ubah Konflik</span>
+            </button>
+            <button onclick="toggleEditScriptMode()" class="px-3.5 py-2 rounded-xl ${appState.isEditingScript ? 'bg-emerald-500 text-slate-950 font-bold' : 'bg-slate-100 dark:bg-studio-800 hover:bg-slate-200 dark:hover:bg-studio-700 font-semibold'} text-xs flex items-center gap-1.5">
+              <i data-lucide="edit-3" class="w-3.5 h-3.5"></i>
+              <span>${appState.isEditingScript ? 'Batal Edit' : 'Edit Naskah'}</span>
+            </button>
+            <button onclick="goToNextEpisode(${epNum})" class="px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 hover:bg-slate-200 dark:hover:bg-studio-700 text-xs font-semibold flex items-center gap-1.5 ml-auto">
+              <span>Lanjutkan ke Episode Berikutnya</span>
+              <i data-lucide="arrow-right" class="w-3.5 h-3.5 text-amber-500"></i>
+            </button>
+          </div>
+
+          <!-- Pemutar Audio Naskah AI -->
+          ${script ? `
+            <div class="p-4 rounded-2xl bg-slate-100/90 dark:bg-studio-900 border border-slate-200 dark:border-slate-800 flex flex-col md:flex-row md:items-center justify-between gap-3">
+              <div class="flex flex-wrap items-center gap-2.5">
+                <div class="flex items-center gap-1.5 text-xs font-bold text-amber-500">
+                  <i data-lucide="volume-2" class="w-4 h-4"></i>
+                  <span>Sulih Suara Naskah AI:</span>
+                </div>
+                <select onchange="appState.selectedVoice = this.value" class="px-2.5 py-1.5 rounded-xl bg-white dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-xs font-semibold">
+                  ${['Kore', 'Aoede', 'Puck', 'Charon'].map(v =>
+                    `<option value="${v}" ${appState.selectedVoice === v ? 'selected' : ''}>Suara ${v}</option>`
+                  ).join('')}
+                </select>
+                <button onclick="generateEpisodeAudio(${epNum})" class="px-3.5 py-1.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs flex items-center gap-1.5">
+                  <i data-lucide="play" class="w-3.5 h-3.5"></i>
+                  <span>Dengarkan Naskah</span>
+                </button>
+                ${appState.audioBlobUrl ? `
+                  <button onclick="downloadEpisodeAudioWav(${epNum})" class="px-3 py-1.5 rounded-xl bg-slate-200 dark:bg-studio-800 text-xs font-semibold flex items-center gap-1">
+                    <i data-lucide="download" class="w-3.5 h-3.5"></i>
+                    <span>Unduh .WAV</span>
+                  </button>
+                ` : ''}
+              </div>
+              ${appState.audioBlobUrl ? `
+                <audio controls src="${appState.audioBlobUrl}" class="h-9 w-full md:w-72"></audio>
+              ` : ''}
+            </div>
+          ` : ''}
+
+          <!-- Isi Naskah Episode -->
+          ${!script ? `
+            <div class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-8 sm:p-12 text-center space-y-4">
+              <span class="px-3 py-1 rounded-full bg-amber-500/15 text-amber-500 text-xs font-bold">EPISODE ${epNum}</span>
+              <h3 class="font-serif font-bold text-2xl">${escapeHtml(epOutline?.title || `Episode ${epNum}`)}</h3>
+              <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400 max-w-xl mx-auto leading-relaxed">
+                ${escapeHtml(epOutline?.summary || 'Naskah untuk episode ini belum ditulis. Klik tombol "Buat Episode" untuk menghasilkan naskah lengkap.')}
+              </p>
+              <button onclick="aiGenerateEpisodeScript(${epNum})" class="px-6 py-3 rounded-2xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm inline-flex items-center gap-2 shadow-lg shadow-amber-500/20">
+                <i data-lucide="sparkles" class="w-4 h-4"></i>
+                <span>Buat Naskah Episode ${epNum} Sekarang</span>
+              </button>
+            </div>
+          ` : appState.isEditingScript ? `
+            <!-- MODE EDIT MANUAL NASKAH -->
+            <div class="rounded-3xl bg-white dark:bg-studio-900 border border-amber-500/40 p-5 sm:p-7 space-y-5">
+              <div class="flex items-center justify-between">
+                <h3 class="font-serif font-bold text-xl text-amber-500">Mode Edit Naskah Episode ${epNum}</h3>
+                <button onclick="saveManualScriptEdits(${epNum})" class="px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs sm:text-sm">Simpan Perubahan</button>
+              </div>
+              <div class="space-y-3">
+                <div>
+                  <label class="block text-xs font-bold mb-1">Judul Episode</label>
+                  <input id="edit-ep-title" type="text" value="${escapeHtml(script.title)}" class="w-full px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 text-sm" />
+                </div>
+                <div>
+                  <label class="block text-xs font-bold mb-1">Ringkasan Episode</label>
+                  <textarea id="edit-ep-summary" rows="2" class="w-full px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 text-sm">${escapeHtml(script.summary)}</textarea>
+                </div>
+                <div>
+                  <label class="block text-xs font-bold mb-1">Adegan Pembuka (Opening Hook)</label>
+                  <textarea id="edit-ep-opening" rows="2" class="w-full px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 text-sm">${escapeHtml(script.openingHook)}</textarea>
+                </div>
+                ${(script.scenes || []).map((sc, idx) => `
+                  <div class="p-4 rounded-2xl bg-slate-50 dark:bg-studio-850 border border-slate-200 dark:border-slate-700 space-y-2.5">
+                    <input id="edit-sc-heading-${idx}" type="text" value="${escapeHtml(sc.heading)}" class="w-full px-3 py-1.5 rounded-lg bg-white dark:bg-studio-800 font-mono text-xs font-bold" />
+                    <textarea id="edit-sc-loc-${idx}" rows="2" class="w-full px-3 py-1.5 rounded-lg bg-white dark:bg-studio-800 text-xs">${escapeHtml(sc.locationDesc)}</textarea>
+                    <textarea id="edit-sc-nar-${idx}" rows="2" class="w-full px-3 py-1.5 rounded-lg bg-white dark:bg-studio-800 text-xs">${escapeHtml(sc.narration)}</textarea>
+                    <div class="space-y-2">
+                      ${(sc.dialogue || []).map((d, dIdx) => `
+                        <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                          <div class="text-xs font-bold py-1.5">${escapeHtml(d.character)}</div>
+                          <input id="edit-dlg-emo-${idx}-${dIdx}" type="text" value="${escapeHtml(d.emotion)}" class="px-2.5 py-1.5 rounded-lg bg-white dark:bg-studio-800 text-xs" />
+                          <input id="edit-dlg-line-${idx}-${dIdx}" type="text" value="${escapeHtml(d.line)}" class="px-2.5 py-1.5 rounded-lg bg-white dark:bg-studio-800 text-xs" />
+                        </div>
+                      `).join('')}
+                    </div>
+                    <input id="edit-sc-cam-${idx}" type="text" value="${escapeHtml(sc.cameraDirection)}" class="w-full px-3 py-1.5 rounded-lg bg-white dark:bg-studio-800 text-xs" />
+                    <input id="edit-sc-vis-${idx}" type="text" value="${escapeHtml(sc.visualDesc)}" class="w-full px-3 py-1.5 rounded-lg bg-white dark:bg-studio-800 text-xs" />
+                    <input id="edit-sc-mus-${idx}" type="text" value="${escapeHtml(sc.musicAmbience)}" class="w-full px-3 py-1.5 rounded-lg bg-white dark:bg-studio-800 text-xs" />
+                  </div>
+                `).join('')}
+                <div>
+                  <label class="block text-xs font-bold mb-1">Adegan Penutup (Cliffhanger)</label>
+                  <textarea id="edit-ep-closing" rows="2" class="w-full px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-studio-800 text-sm">${escapeHtml(script.closingCliffhanger)}</textarea>
+                </div>
+              </div>
+              <div class="flex justify-end">
+                <button onclick="saveManualScriptEdits(${epNum})" class="px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs sm:text-sm">Simpan Perubahan</button>
+              </div>
+            </div>
+          ` : `
+            <!-- TAMPILAN BACA NASKAH PROFESIONAL -->
+            <article class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-5 sm:p-8 space-y-6 shadow-sm">
+              <div class="border-b border-slate-200 dark:border-slate-800 pb-5 space-y-2">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <span class="px-3 py-1 rounded-full bg-amber-500/15 text-amber-500 font-bold text-xs">EPISODE ${script.episodeNumber}</span>
+                  <button onclick="copyTextToClipboard(compileEpisodeText(${epNum}))" class="text-xs font-semibold text-slate-500 hover:text-amber-500 flex items-center gap-1">
+                    <i data-lucide="copy" class="w-3.5 h-3.5"></i>
+                    <span>Salin Naskah Episode</span>
+                  </button>
+                </div>
+                <h2 class="font-serif font-extrabold text-2xl sm:text-3xl">${escapeHtml(script.title)}</h2>
+                <p class="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">${escapeHtml(script.summary)}</p>
+              </div>
+
+              <!-- Adegan Pembuka -->
+              <div class="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/25 space-y-1">
+                <span class="text-[11px] font-bold uppercase tracking-wider text-amber-500">Adegan Pembuka yang Menarik (Opening Hook)</span>
+                <p class="text-xs sm:text-sm text-slate-800 dark:text-slate-200 leading-relaxed">${escapeHtml(script.openingHook)}</p>
+              </div>
+
+              <!-- Pembagian Adegan -->
+              <div class="space-y-6">
+                ${(script.scenes || []).map((sc, idx) => `
+                  <div class="rounded-2xl bg-slate-50 dark:bg-studio-850 border border-slate-200 dark:border-slate-800 p-4 sm:p-6 space-y-4">
+                    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-200 dark:border-slate-700/70 pb-3">
+                      <div>
+                        <span class="font-mono text-xs font-bold text-amber-500">ADEGAN ${sc.sceneNumber || idx + 1} • ${escapeHtml(sc.heading)}</span>
+                        <p class="text-xs text-slate-500 dark:text-slate-400 mt-0.5">${escapeHtml(sc.locationDesc)}</p>
+                      </div>
+                      <button onclick="aiGenerateSceneIllustration(${epNum}, ${idx})" class="shrink-0 px-3 py-1.5 rounded-xl bg-amber-500/15 hover:bg-amber-500 hover:text-slate-950 text-amber-600 dark:text-amber-300 border border-amber-500/30 font-bold text-xs flex items-center gap-1.5 transition-all">
+                        <i data-lucide="image" class="w-3.5 h-3.5"></i>
+                        <span>Ilustrasi Adegan AI</span>
+                      </button>
+                    </div>
+
+                    <div class="flex flex-wrap items-center gap-1.5 text-[11px]">
+                      <span class="font-bold text-slate-500">Karakter Tampil:</span>
+                      ${(sc.charactersPresent || []).map(ch => `<span class="px-2 py-0.5 rounded-md bg-slate-200 dark:bg-studio-800 font-semibold">${escapeHtml(ch)}</span>`).join('')}
+                    </div>
+
+                    ${sc.narration ? `
+                      <p class="text-xs sm:text-sm italic text-slate-600 dark:text-slate-300 border-l-2 border-amber-500 pl-3">
+                        "${escapeHtml(sc.narration)}"
+                      </p>
+                    ` : ''}
+
+                    <!-- Dialog Lengkap -->
+                    <div class="space-y-2.5">
+                      ${(sc.dialogue || []).map(d => `
+                        <div class="p-3 rounded-xl bg-white dark:bg-studio-900/90 border border-slate-200/80 dark:border-slate-800">
+                          <div class="flex items-center gap-2 mb-1">
+                            <span class="font-bold text-xs sm:text-sm text-amber-600 dark:text-amber-400">${escapeHtml(d.character)}</span>
+                            <span class="text-[11px] italic text-slate-400">(${escapeHtml(d.emotion)})</span>
+                          </div>
+                          <p class="text-xs sm:text-sm text-slate-800 dark:text-slate-100 leading-relaxed">${escapeHtml(d.line)}</p>
+                        </div>
+                      `).join('')}
+                    </div>
+
+                    <!-- Arahan Teknis Sutradara -->
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-2.5 pt-2 text-[11px]">
+                      <div class="p-2.5 rounded-xl bg-white dark:bg-studio-900 border border-slate-200/70 dark:border-slate-800">
+                        <span class="font-bold text-sky-400 block mb-0.5">Gerakan Kamera:</span>
+                        <span class="text-slate-600 dark:text-slate-300">${escapeHtml(sc.cameraDirection)}</span>
+                      </div>
+                      <div class="p-2.5 rounded-xl bg-white dark:bg-studio-900 border border-slate-200/70 dark:border-slate-800">
+                        <span class="font-bold text-emerald-400 block mb-0.5">Deskripsi Visual:</span>
+                        <span class="text-slate-600 dark:text-slate-300">${escapeHtml(sc.visualDesc)}</span>
+                      </div>
+                      <div class="p-2.5 rounded-xl bg-white dark:bg-studio-900 border border-slate-200/70 dark:border-slate-800">
+                        <span class="font-bold text-purple-400 block mb-0.5">Musik & Suasana:</span>
+                        <span class="text-slate-600 dark:text-slate-300">${escapeHtml(sc.musicAmbience)}</span>
+                      </div>
+                    </div>
+                  </div>
+                `).join('')}
+              </div>
+
+              <!-- Adegan Penutup Cliffhanger -->
+              <div class="p-4 rounded-2xl bg-rose-500/10 border border-rose-500/30 space-y-1">
+                <span class="text-[11px] font-bold uppercase tracking-wider text-rose-400">Adegan Penutup (Cliffhanger Penasaran)</span>
+                <p class="text-xs sm:text-sm text-slate-800 dark:text-slate-200 leading-relaxed">${escapeHtml(script.closingCliffhanger)}</p>
+              </div>
+            </article>
+          `}
+        </div>
+      `;
+    }
+
+    /**
+     * =========================================================================
+     * 14. RENDER GENERATOR GAMBAR AI (STUDIO VISUAL)
+     * =========================================================================
+     */
+    function renderVisualsView() {
+      const proj = getActiveProject();
+      const chars = proj.characters || [];
+      const episodes = proj.storyArc?.episodes || [];
+      const gallery = (proj.gallery || []).filter(g => g.imageUrl);
+
+      const sceneOptions = [];
+      Object.entries(proj.scripts || {}).forEach(([epKey, scObj]) => {
+        (scObj.scenes || []).forEach((sc, idx) => {
+          sceneOptions.push({
+            val: `scene:${epKey}:${idx}`,
+            label: `Ep ${epKey} - Adegan ${sc.sceneNumber || idx + 1}: ${sc.heading}`
+          });
+        });
+      });
+
+      return `
+        <div class="space-y-6 animate-fade-in">
+          <div>
+            <span class="text-xs font-bold uppercase tracking-wider text-amber-500">Tahap 5 • Sinematografi & Poster</span>
+            <h1 class="font-serif font-bold text-2xl sm:text-3xl">Generator Gambar AI Studio</h1>
+            <p class="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mt-1">Buat poster serial, foto karakter konsisten, ilustrasi adegan, latar lokasi, thumbnail, dan sampul episode.</p>
+          </div>
+
+          <!-- Form Studio Visual -->
+          <div class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-5 sm:p-6 space-y-4">
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+              <div>
+                <label class="block text-xs font-semibold mb-1.5">Jenis Gambar Visual</label>
+                <select id="vis-category" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-xs sm:text-sm">
+                  <option value="Poster utama serial">Poster utama serial</option>
+                  <option value="Foto setiap karakter">Foto setiap karakter</option>
+                  <option value="Ilustrasi setiap adegan">Ilustrasi setiap adegan</option>
+                  <option value="Background lokasi">Background lokasi</option>
+                  <option value="Gambar thumbnail episode">Gambar thumbnail episode</option>
+                  <option value="Sampul setiap episode">Sampul setiap episode</option>
+                </select>
+              </div>
+
+              <div>
+                <label class="block text-xs font-semibold mb-1.5">Gaya Visual Sinematik</label>
+                <select id="vis-style" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-xs sm:text-sm">
+                  ${VISUAL_STYLES.map(st => `<option value="${st.id}">${escapeHtml(st.name)}</option>`).join('')}
+                </select>
+              </div>
+
+              <div>
+                <label class="block text-xs font-semibold mb-1.5">Target Karakter / Episode / Adegan</label>
+                <select id="vis-target" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-xs sm:text-sm">
+                  <option value="series">Seluruh Serial (${escapeHtml(proj.settings.title)})</option>
+                  ${chars.map(c => `<option value="char:${c.id}">Karakter: ${escapeHtml(c.name)}</option>`).join('')}
+                  ${episodes.map(ep => `<option value="ep:${ep.episodeNumber}">Episode ${ep.episodeNumber}: ${escapeHtml(ep.title)}</option>`).join('')}
+                  ${sceneOptions.map(so => `<option value="${so.val}">${escapeHtml(so.label)}</option>`).join('')}
+                </select>
+              </div>
+
+              <div>
+                <label class="block text-xs font-semibold mb-1.5">Rasio Bingkai (Aspect Ratio)</label>
+                <select id="vis-aspect" class="w-full px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-xs sm:text-sm">
+                  <option value="3:4">3:4 (Poster & Potret Karakter)</option>
+                  <option value="16:9">16:9 (Layar Lebar & Thumbnail)</option>
+                  <option value="9:16">9:16 (Vertikal / Story / Reels)</option>
+                  <option value="1:1">1:1 (Persegi / Sampul)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="flex flex-col sm:flex-row gap-3">
+              <input id="vis-custom-note" type="text" placeholder="Arahan tambahan sutradara (opsional), misal: Hujan rintik malam hari dengan cahaya lampu dermaga..."
+                class="flex-1 px-3.5 py-2.5 rounded-xl bg-slate-100 dark:bg-studio-800 border border-slate-200 dark:border-slate-700 text-xs sm:text-sm" />
+              <button onclick="aiGenerateVisualAsset()" class="px-6 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-amber-500/20 shrink-0">
+                <i data-lucide="sparkles" class="w-4 h-4"></i>
+                <span>Buat Gambar AI</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Galeri Hasil Visual -->
+          <section class="space-y-4">
+            <h2 class="font-serif font-bold text-xl flex items-center gap-2">
+              <i data-lucide="gallery-thumbnails" class="w-5 h-5 text-amber-500"></i>
+              <span>Galeri Visual Produksi (${gallery.length})</span>
+            </h2>
+
+            ${gallery.length === 0 ? `
+              <div class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 p-10 text-center space-y-2">
+                <i data-lucide="image" class="w-10 h-10 text-amber-500 mx-auto"></i>
+                <h3 class="font-serif font-bold text-lg">Galeri Visual Masih Kosong</h3>
+                <p class="text-xs text-slate-500 max-w-md mx-auto">Pilih jenis gambar dan gaya visual di atas, lalu klik "Buat Gambar AI" untuk merender poster atau ilustrasi adegan.</p>
+              </div>
+            ` : `
+              <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+                ${gallery.map(item => `
+                  <div class="rounded-3xl bg-white dark:bg-studio-900 border border-slate-200 dark:border-slate-800 overflow-hidden flex flex-col justify-between shadow-sm">
+                    <div onclick="openImagePreviewModal('${item.id}')" class="relative aspect-[4/3] bg-slate-950 overflow-hidden cursor-pointer group">
+                      <img src="${item.imageUrl}" alt="${escapeHtml(item.title)}" class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300" />
+                      <span class="absolute top-3 left-3 text-[10px] font-bold px-2.5 py-1 rounded-full bg-slate-950/80 text-amber-300 backdrop-blur-md">
+                        ${escapeHtml(item.category)}
+                      </span>
+                    </div>
+                    <div class="p-4 space-y-3">
+                      <div>
+                        <h3 class="font-bold text-sm line-clamp-1">${escapeHtml(item.title)}</h3>
+                        <p class="text-[11px] text-slate-500 dark:text-slate-400">${escapeHtml(item.styleName)}</p>
+                      </div>
+                      <div class="flex items-center gap-2">
+                        <button onclick="openImagePreviewModal('${item.id}')" class="flex-1 py-2 px-3 rounded-xl bg-slate-100 dark:bg-studio-800 hover:bg-slate-200 dark:hover:bg-studio-700 text-xs font-semibold">
+                          Pratinjau
+                        </button>
+                        <button onclick="downloadImageById('${item.id}')" class="flex-1 py-2 px-3 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold flex items-center justify-center gap-1">
+                          <i data-lucide="download" class="w-3.5 h-3.5"></i>
+                          <span>Unduh</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                `).join('')}
+              </div>
+            `}
+          </section>
+        </div>
+      `;
+    }
+
+    /**
+     * =========================================================================
+     * 15. EKSPOR DOKUMEN SERIAL & ROUTER UTAMA
+     * =========================================================================
+     */
+    function compileEpisodeText(epNum) {
+      const proj = getActiveProject();
+      const sc = proj.scripts?.[epNum];
+      if (!sc) return '';
+
+      let out = `EPISODE ${sc.episodeNumber}: ${sc.title.toUpperCase()}\n`;
+      out += `Ringkasan: ${sc.summary}\n`;
+      out += `Adegan Pembuka: ${sc.openingHook}\n\n`;
+
+      (sc.scenes || []).forEach((s, idx) => {
+        out += `--- ADEGAN ${s.sceneNumber || idx + 1}: ${s.heading} ---\n`;
+        out += `Lokasi: ${s.locationDesc}\n`;
+        out += `Karakter: ${(s.charactersPresent || []).join(', ')}\n`;
+        if (s.narration) out += `Narasi: ${s.narration}\n`;
+        (s.dialogue || []).forEach(d => {
+          out += `${d.character.toUpperCase()} (${d.emotion}): ${d.line}\n`;
+        });
+        out += `[Kamera: ${s.cameraDirection} | Visual: ${s.visualDesc} | Musik: ${s.musicAmbience}]\n\n`;
+      });
+
+      out += `Adegan Penutup (Cliffhanger): ${sc.closingCliffhanger}\n`;
+      return out;
+    }
+
+    function compileFullSeriesDocument() {
+      const proj = getActiveProject();
+      const s = proj.settings;
+      let doc = `====================================================\n`;
+      doc += `DRAMA STUDIO AI – PAKET PRODUKSI SERIAL DRAMA\n`;
+      doc += `====================================================\n\n`;
+      doc += `JUDUL SERIAL : ${s.title}\n`;
+      doc += `GENRE        : ${proj.customGenre || proj.genre}\n`;
+      doc += `TEMA UTAMA   : ${s.theme}\n`;
+      doc += `LATAR & ZAMAN: ${s.settingPlace} (${s.era})\n`;
+      doc += `SUASANA      : ${s.mood}\n`;
+      doc += `JUMLAH EP    : ${s.episodeCount} Episode (${s.episodeDuration})\n`;
+      doc += `PESAN MORAL  : ${s.moralMessage}\n\n`;
+      doc += `SINOPSIS CERITA:\n${s.synopsis}\n\n`;
+
+      doc += `====================================================\n`;
+      doc += `DAFTAR KARAKTER & KONSISTENSI VISUAL\n`;
+      doc += `====================================================\n`;
+      (proj.characters || []).forEach((c, i) => {
+        doc += `${i + 1}. ${c.name} (${c.age}, ${c.gender}) - ${c.role}\n`;
+        doc += `   Sifat      : ${c.personality}\n`;
+        doc += `   Latar      : ${c.background}\n`;
+        doc += `   Hubungan   : ${c.relationships}\n`;
+        doc += `   Ciri Fisik : ${c.physicalTraits}\n`;
+        doc += `   Pakaian    : ${c.clothingStyle}\n\n`;
+      });
+
+      if (proj.storyArc) {
+        doc += `====================================================\n`;
+        doc += `ALUR CERITA SERIAL BERSERI\n`;
+        doc += `====================================================\n`;
+        doc += `Konflik Utama   : ${proj.storyArc.mainConflict}\n`;
+        doc += `Konflik Tambahan: ${proj.storyArc.subConflicts}\n`;
+        doc += `Klimaks         : ${proj.storyArc.climax}\n`;
+        doc += `Plot Twist      : ${proj.storyArc.plotTwist}\n`;
+        doc += `Penyelesaian    : ${proj.storyArc.resolution}\n\n`;
+        (proj.storyArc.episodes || []).forEach(ep => {
+          doc += `Episode ${ep.episodeNumber} - ${ep.title}: ${ep.summary}\n`;
+        });
+        doc += `\n`;
+      }
+
+      doc += `====================================================\n`;
+      doc += `NASKAH EPISODE YANG TELAH DIBUAT\n`;
+      doc += `====================================================\n\n`;
+      Object.keys(proj.scripts || {}).sort((a, b) => Number(a) - Number(b)).forEach(epKey => {
+        doc += compileEpisodeText(Number(epKey)) + `\n`;
       });
 
       return doc;
@@ -3305,28 +3057,58 @@ Style: ${VISUAL_STYLES[0].prompt}.`;
 
     function downloadFullSeriesTxt() {
       const proj = getActiveProject();
-      const content = compileFullSeriesDocument();
-      const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+      const text = compileFullSeriesDocument();
+      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
       const url = URL.createObjectURL(blob);
+      const safeName = (proj.settings.title || 'serial_drama').toLowerCase().replace(/[^a-z0-9]+/g, '_');
+
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${(proj.settings.title || 'Serial_Drama').replace(/\s+/g, '_')}_DramaStudioAI.txt`;
+      a.download = `${safeName}_produksi_lengkap.txt`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-      showToast('File naskah lengkap berhasil diunduh!', 'success');
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      showToast('Dokumen lengkap serial berhasil diunduh (.TXT)!', 'success');
     }
 
     function copyFullSeriesText() {
       copyTextToClipboard(compileFullSeriesDocument());
     }
 
-    /**
-     * =========================================================================
-     * 13. MAIN RENDER ROUTER & INITIALIZATION
-     * =========================================================================
-     */
+    function openExportModal() {
+      const proj = getActiveProject();
+      openModal(`
+        <div class="flex items-center justify-between mb-4">
+          <div class="flex items-center gap-2.5">
+            <div class="w-9 h-9 rounded-xl bg-amber-500/15 text-amber-500 flex items-center justify-center">
+              <i data-lucide="download" class="w-5 h-5"></i>
+            </div>
+            <div>
+              <h3 class="font-serif font-bold text-xl">Ekspor Paket Produksi Serial</h3>
+              <p class="text-xs text-slate-500 dark:text-slate-400">${escapeHtml(proj.settings.title)}</p>
+            </div>
+          </div>
+          <button onclick="closeModal()" class="p-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-studio-800 text-slate-400">
+            <i data-lucide="x" class="w-5 h-5"></i>
+          </button>
+        </div>
+        <p class="text-xs sm:text-sm text-slate-600 dark:text-slate-300 mb-5 leading-relaxed">
+          Unduh atau salin seluruh dokumen serial drama Anda (meliputi sinopsis, profil karakter lengkap, alur episode, serta seluruh naskah dialog yang telah dibuat).
+        </p>
+        <div class="flex flex-col sm:flex-row justify-end gap-2.5">
+          <button onclick="copyFullSeriesText()" class="px-4 py-2.5 rounded-xl bg-slate-200 dark:bg-studio-800 hover:bg-slate-300 dark:hover:bg-studio-700 text-xs sm:text-sm font-semibold flex items-center justify-center gap-1.5">
+            <i data-lucide="copy" class="w-4 h-4"></i>
+            <span>Salin Semua Naskah</span>
+          </button>
+          <button onclick="downloadFullSeriesTxt()" class="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs sm:text-sm font-bold flex items-center justify-center gap-1.5">
+            <i data-lucide="file-down" class="w-4 h-4"></i>
+            <span>Unduh Dokumen (.TXT)</span>
+          </button>
+        </div>
+      `);
+    }
+
     function renderApp() {
       updateHeaderAndNav();
       const container = document.getElementById('app-content');
